@@ -79,7 +79,9 @@ namespace Unity.MLAgents.Sensors
             {
                 bodyPosesEnabled = m_PoseExtractor.GetBodyPosesEnabled();
             }
-            m_PoseExtractor = new RigidBodyPoseExtractor(RootBody, gameObject, VirtualRoot, bodyPosesEnabled);
+            // Check if RootBody exists in gameObject hierarchy. If so, use gameObject, otherwise use null (defaults to RootBody.gameObject)
+            GameObject searchRoot = (RootBody != null && RootBody.transform.IsChildOf(gameObject.transform)) ? gameObject : null;
+            m_PoseExtractor = new RigidBodyPoseExtractor(RootBody, searchRoot, VirtualRoot, bodyPosesEnabled);
         }
 
         /// <summary>
