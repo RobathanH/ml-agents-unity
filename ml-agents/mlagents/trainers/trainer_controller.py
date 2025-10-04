@@ -167,6 +167,11 @@ class TrainerController:
     @timed
     def start_learning(self, env_manager: EnvManager) -> None:
         self._create_output_path(self.output_path)
+        
+        # Set environment manager reference in ghost controller for learning team communication
+        if self.ghost_controller is not None:
+            self.ghost_controller.set_env_manager(env_manager)
+        
         try:
             # Initial reset
             self._reset_env(env_manager)

@@ -1,5 +1,5 @@
 from mlagents_envs.logging_util import get_logger
-from typing import Deque, Dict
+from typing import Deque, Dict, Optional
 from collections import deque
 from mlagents.trainers.ghost.trainer import GhostTrainer
 
@@ -28,6 +28,8 @@ class GhostController:
         self._ghost_trainers: Dict[int, GhostTrainer] = {}
         # Signals to the trainer control to perform a hard change_training_team
         self._changed_training_team = False
+        # Reference to environment manager for sending learning team updates
+        self._env_manager = None
 
     @property
     def get_learning_team(self) -> int:
@@ -58,9 +60,20 @@ class GhostController:
             self._ghost_trainers[team_id] = trainer
             if self._learning_team < 0:
                 self._learning_team = team_id
+                self._send_learning_team_to_unity()
             else:
                 self._queue.append(team_id)
 
+    def set_env_manager(self, env_manager) -> None:
+        """
+        Set the environment manager reference to enable learning team communication.
+        :param env_manager: The EnvManager instance to send environment parameters to
+        """
+        self._env_manager = env_manager
+        # Send initial learning team if already set
+        if self._learning_team >= 0:
+            self._send_learning_team_to_unity()
+    
     def change_training_team(self, step: int) -> None:
         """
         The current learning team is added to the end of the queue and then updated with the
@@ -71,6 +84,25 @@ class GhostController:
         self._learning_team = self._queue.popleft()
         logger.debug(f"Learning team {self._learning_team} swapped on step {step}")
         self._changed_training_team = True
+        
+        # Send the new learning team to Unity
+        self._send_learning_team_to_unity()
+    
+    def _send_learning_team_to_unity(self) -> None:
+        """
+        Send the current learning team ID to Unity via environment parameters.
+        This allows Unity to track which agent is currently learning for stats recording.
+        """
+        if self._env_manager is not None and self._learning_team >= 0:
+            try:
+                env_params = {"learning_team": float(self._learning_team)}
+                self._env_manager.set_env_parameters(env_params)
+                logger.debug(f"Sent learning team {self._learning_team} to Unity environment")
+                
+            except Exception as e:
+                logger.warning(f"Failed to send learning team to Unity: {e}")
+        else:
+            logger.debug("Cannot send learning team - env_manager not set or learning team not initialized")
 
     # Adapted from https://github.com/Unity-Technologies/ml-agents/pull/1975 and
     # https://metinmediamath.wordpress.com/2013/11/27/how-to-calculate-the-elo-rating-including-example/
