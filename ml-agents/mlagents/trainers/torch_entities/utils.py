@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 from mlagents.torch_utils import torch, nn
 from mlagents.trainers.torch_entities.layers import LinearEncoder, Initialization
 import numpy as np
@@ -10,6 +10,7 @@ from mlagents.trainers.torch_entities.encoders import (
     SmallVisualEncoder,
     FullyConnectedVisualEncoder,
     VectorInput,
+    VAEVectorInput,
 )
 from mlagents.trainers.settings import EncoderType, ScheduleType
 from mlagents.trainers.torch_entities.attention import (
@@ -150,6 +151,7 @@ class ModelUtils:
         h_size: int,
         attention_embedding_size: int,
         vis_encode_type: EncoderType,
+        sensor_encoder_registry: Optional[Dict[str, Any]] = None,
     ) -> Tuple[nn.Module, int]:
         """
         Returns the encoder and the size of the appropriate encoder.
@@ -169,8 +171,16 @@ class ModelUtils:
                 shape[1], shape[2], vis_encode_type
             )
             return (visual_encoder_class(shape[1], shape[2], shape[0], h_size), h_size)
-        # VECTOR
+        # VECTOR (optionally replace with VAE-based processor)
         if dim_prop in ModelUtils.VALID_VECTOR_PROP:
+            if sensor_encoder_registry is not None and obs_spec.name in sensor_encoder_registry:
+                enc_cfg = sensor_encoder_registry[obs_spec.name]
+                encoder_module = enc_cfg["module"]
+                stop_grad: bool = enc_cfg.get("stop_gradient", True)
+                normalize_obs: bool = enc_cfg.get("normalize", normalize)
+                vae_proc = VAEVectorInput(shape[0], encoder_module, normalize_obs, stop_grad)
+                latent_size: int = enc_cfg["latent_size"]
+                return (vae_proc, latent_size)
             return (VectorInput(shape[0], normalize), shape[0])
         # VARIABLE LENGTH
         if dim_prop in ModelUtils.VALID_VAR_LEN_PROP:
@@ -192,6 +202,7 @@ class ModelUtils:
         vis_encode_type: EncoderType,
         attention_embedding_size: int,
         normalize: bool = False,
+        sensor_encoder_registry: Optional[Dict[str, Any]] = None,
     ) -> Tuple[nn.ModuleList, List[int]]:
         """
         Creates visual and vector encoders, along with their normalizers.
@@ -213,7 +224,12 @@ class ModelUtils:
         embedding_sizes: List[int] = []
         for obs_spec in observation_specs:
             encoder, embedding_size = ModelUtils.get_encoder_for_obs(
-                obs_spec, normalize, h_size, attention_embedding_size, vis_encode_type
+                obs_spec,
+                normalize,
+                h_size,
+                attention_embedding_size,
+                vis_encode_type,
+                sensor_encoder_registry,
             )
             encoders.append(encoder)
             embedding_sizes.append(embedding_size)

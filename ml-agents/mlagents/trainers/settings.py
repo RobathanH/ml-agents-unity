@@ -115,6 +115,58 @@ class ConditioningType(Enum):
 
 
 @attr.s(auto_attribs=True)
+class SensorEncoderDefaults:
+    hidden_layers: int = 2
+    hidden_size: Any = "auto"  # "auto" => raw_dim; can be int as well
+    beta: float = 1.0
+    lr: float = 1.0e-3
+    batch_size: int = 256
+    buffer_size: int = 500000
+    normalize: bool = True
+    # If true, encoders are detached and trained with off-policy reconstruction (separate optimizer/buffer).
+    # If false, encoders are trained on-policy with an auxiliary reconstruction+KL loss; policy gradients also flow.
+    offpolicy_reconstruction: bool = True
+    # Weight applied to the on-policy reconstruction loss when offpolicy_reconstruction is False.
+    onpolicy_reconstruction_weight: float = 0.1
+    # Reconstruction loss type for VAE: "smooth_l1" (robust) or "mse".
+    reconstruction_loss: str = "smooth_l1"
+    # Delta parameter for Smooth L1 (Huber) loss.
+    huber_delta: float = 1.0
+
+
+@attr.s(auto_attribs=True)
+class SensorEncoderOverride:
+    name: str = attr.ib()
+    latent_size: Optional[int] = None
+    hidden_layers: Optional[int] = None
+    hidden_size: Optional[int] = None
+    beta: Optional[float] = None
+    lr: Optional[float] = None
+    batch_size: Optional[int] = None
+    buffer_size: Optional[int] = None
+    normalize: Optional[bool] = None
+    offpolicy_reconstruction: Optional[bool] = None
+    onpolicy_reconstruction_weight: Optional[float] = None
+    reconstruction_loss: Optional[str] = None
+    huber_delta: Optional[float] = None
+
+
+@attr.s(auto_attribs=True)
+class SensorEncodersSettings:
+    enabled: bool = False
+    auto: bool = True
+    # apply_to_types: ["vector"] for now. Future: ["visual", "buffer"]
+    apply_to_types: List[str] = attr.ib(factory=lambda: ["vector"])
+    # Proportion of raw dimension for latent size if not explicitly set
+    latent_proportion: float = 0.25
+    # Clamp latent sizes for stability
+    min_latent_size: int = 16
+    max_latent_size: int = 128
+    defaults: SensorEncoderDefaults = attr.ib(factory=SensorEncoderDefaults)
+    sensors: List[SensorEncoderOverride] = attr.ib(factory=list)
+
+
+@attr.s(auto_attribs=True)
 class NetworkSettings:
     @attr.s
     class MemorySettings:
@@ -139,6 +191,8 @@ class NetworkSettings:
     memory: Optional[MemorySettings] = None
     goal_conditioning_type: ConditioningType = ConditioningType.HYPER
     deterministic: bool = parser.get_default("deterministic")
+    # Optional sensor encoder configuration (e.g., VAEs) applied to observations
+    sensor_encoders: Optional[SensorEncodersSettings] = None
 
 
 @attr.s(auto_attribs=True)
@@ -249,6 +303,8 @@ class RNDSettings(RewardSignalSettings):
     learning_rate: float = 1e-4
     encoding_size: Optional[int] = None
 
+
+## Duplicate Sensor Encoder definitions removed (defined earlier above NetworkSettings)
 
 # SAMPLERS #############################################################################
 class ParameterRandomizationType(Enum):

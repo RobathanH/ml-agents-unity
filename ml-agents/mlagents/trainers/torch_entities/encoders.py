@@ -109,6 +109,49 @@ class VectorInput(nn.Module):
             self.normalizer.update(inputs)
 
 
+class VAEVectorInput(nn.Module):
+    """
+    Vector observation processor that replaces raw inputs with features from a VAE encoder.
+    The decoder and loss are used only during training via a separate manager; forward() is
+    deterministic and returns the encoder mean for ONNX export stability. Optional input
+    normalization mirrors VectorInput.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        encoder: nn.Module,
+        normalize: bool = False,
+        stop_gradient: bool = True,
+    ):
+        super().__init__()
+        self.encoder = encoder  # Should expose a forward that returns mean features
+        self.normalizer: Optional[Normalizer] = None
+        if normalize:
+            self.normalizer = Normalizer(input_size)
+        self._stop_gradient = stop_gradient
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if self.normalizer is not None:
+            inputs = self.normalizer(inputs)
+        # Expect encoder to provide deterministic latent features via encode_mean if available
+        if hasattr(self.encoder, "encode_mean"):
+            features = self.encoder.encode_mean(inputs)  # type: ignore[attr-defined]
+        else:
+            features = self.encoder(inputs)
+        if self._stop_gradient:
+            features = features.detach()
+        return features
+
+    def copy_normalization(self, other_input: "VAEVectorInput") -> None:
+        if self.normalizer is not None and other_input.normalizer is not None:
+            self.normalizer.copy_from(other_input.normalizer)
+
+    def update_normalization(self, inputs: torch.Tensor) -> None:
+        if self.normalizer is not None:
+            self.normalizer.update(inputs)
+
+
 class FullyConnectedVisualEncoder(nn.Module):
     def __init__(
         self, height: int, width: int, initial_channels: int, output_size: int

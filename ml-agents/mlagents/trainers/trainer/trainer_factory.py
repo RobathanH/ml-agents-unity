@@ -9,6 +9,7 @@ from mlagents.trainers.ghost.trainer import GhostTrainer
 from mlagents.trainers.ghost.controller import GhostController
 from mlagents.trainers.settings import TrainerSettings
 from mlagents.plugins import all_trainer_types
+from mlagents.trainers.sensor_encoders.manager import VAESensorManager
 
 
 logger = get_logger(__name__)
@@ -128,4 +129,6 @@ class TrainerFactory:
                 train_model,
                 trainer_artifact_path,
             )
+        # No explicit wrapping required here; VAE modules are owned by policies and
+        # VAE training is coordinated from trainers during trajectory processing.
         return trainer

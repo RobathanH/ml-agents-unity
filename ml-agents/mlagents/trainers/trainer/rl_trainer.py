@@ -27,6 +27,7 @@ from mlagents.trainers.trajectory import Trajectory
 from mlagents.trainers.settings import TrainerSettings
 from mlagents.trainers.stats import StatsPropertyType
 from mlagents.trainers.model_saver.model_saver import BaseModelSaver
+from mlagents.trainers.sensor_encoders.manager import VAESensorManager
 
 
 logger = get_logger(__name__)
@@ -57,6 +58,8 @@ class RLTrainer(Trainer):
             self.trainer_settings, self.artifact_path, self.load
         )
         self._has_warned_group_rewards = False
+        # Optional sensor encoder manager (initialized by OnPolicy trainers when enabled)
+        self._vae_manager: Optional[VAESensorManager] = None
 
     def end_episode(self) -> None:
         """
@@ -220,6 +223,10 @@ class RLTrainer(Trainer):
         Takes a trajectory and processes it, putting it into the update buffer.
         :param trajectory: The Trajectory tuple containing the steps to be processed.
         """
+        # Feed raw observations to VAE buffers if present
+        if self._vae_manager is not None:
+            for step in trajectory.steps:
+                self._vae_manager.push_observations(step.obs)
         self._maybe_write_summary(self.get_step + len(trajectory.steps))
         self._maybe_save_model(self.get_step + len(trajectory.steps))
         self._increment_step(len(trajectory.steps), trajectory.behavior_id)
@@ -300,6 +307,11 @@ class RLTrainer(Trainer):
             if self._is_ready_update():
                 with hierarchical_timer("_update_policy"):
                     if self._update_policy():
+                        # After RL update, run a VAE update cycle if available
+                        if self._vae_manager is not None:
+                            vae_stats = self._vae_manager.maybe_update()
+                            for k, v in vae_stats.items():
+                                self.stats_reporter.add_stat(k, v)
                         for q in self.policy_queues:
                             # Get policies that correspond to the policy queue in question
                             q.put(self.get_policy(q.behavior_id))

@@ -39,6 +39,7 @@ class ObservationEncoder(nn.Module):
         h_size: int,
         vis_encode_type: EncoderType,
         normalize: bool = False,
+        sensor_encoder_registry: Optional[Dict[str, Any]] = None,
     ):
         """
         Returns an ObservationEncoder that can process and encode a set of observations.
@@ -51,6 +52,7 @@ class ObservationEncoder(nn.Module):
             vis_encode_type,
             self.ATTENTION_EMBEDDING_SIZE,
             normalize=normalize,
+            sensor_encoder_registry=sensor_encoder_registry,
         )
         self.rsa, self.x_self_encoder = ModelUtils.create_residual_self_attention(
             self.processors, self.embedding_sizes, self.ATTENTION_EMBEDDING_SIZE
@@ -191,6 +193,7 @@ class NetworkBody(nn.Module):
             self.h_size,
             network_settings.vis_encode_type,
             self.normalize,
+            sensor_encoder_registry=getattr(network_settings, "_sensor_encoder_registry", None),
         )
         self.processors = self.observation_encoder.processors
         total_enc_size = self.observation_encoder.total_enc_size
@@ -279,6 +282,7 @@ class MultiAgentNetworkBody(torch.nn.Module):
             self.h_size,
             network_settings.vis_encode_type,
             self.normalize,
+            sensor_encoder_registry=getattr(network_settings, "_sensor_encoder_registry", None),
         )
         self.processors = self.observation_encoder.processors
 

@@ -178,6 +178,74 @@ class TorchPPOOptimizer(TorchOptimizer):
             - decay_bet * ModelUtils.masked_mean(entropy, loss_masks)
         )
 
+        # Optional on-policy auxiliary VAE reconstruction loss: if any encoders are configured
+        # for on-policy training (i.e., offpolicy_reconstruction is False), compute their recon+KL
+        # losses on the current minibatch and add with a small weight. We must reconstruct from the
+        # same raw vector observations used by those encoders. This requires that VAE modules are
+        # available from the policy's input processors via the sensor encoder registry; here we
+        # access them through the actor's processors when present.
+        try:
+            aux_total = None
+            # The actor exposes input processors via actor.vector_processors/visual_processors depending on build.
+            # We defensively iterate over all processors to find VAEVectorInput and its underlying encoder.
+            processors = []
+            if hasattr(self.policy.actor, "vector_processors"):
+                processors.extend(list(self.policy.actor.vector_processors))
+            if hasattr(self.policy.actor, "processors"):
+                processors.extend(list(self.policy.actor.processors))
+            # current_obs is list aligned with observation_specs; build per-processor inputs
+            obs_specs = self.policy.behavior_spec.observation_specs
+            obs_tensors = current_obs
+            for idx, obs_spec in enumerate(obs_specs):
+                # Skip non-vector
+                if obs_spec.shape is None or len(obs_spec.shape) != 1:
+                    continue
+                # Find corresponding processor if it is a VAEVectorInput
+                proc = None
+                if idx < len(processors):
+                    proc = processors[idx]
+                if proc is None:
+                    continue
+                from mlagents.trainers.torch_entities.encoders import VAEVectorInput  # local import to avoid cycles
+                if not isinstance(proc, VAEVectorInput):
+                    continue
+                # Check meta in registry via encoder attributes; fallback to defaults
+                # If processor is detached (stop_gradient True), we are in off-policy mode -> skip
+                if getattr(proc, "_stop_gradient", True):
+                    continue
+                # Compute recon loss using the underlying VAE on current batch inputs
+                vec = obs_tensors[idx]
+                vae_module = proc.encoder
+                recon, mu, logvar = vae_module(vec)
+                # Look up beta and aux weight from manager meta if available; otherwise use reasonable defaults
+                beta = 1.0
+                onpolicy_weight = 0.1
+                if hasattr(self.trainer_settings.network_settings, "sensor_encoders") and self.trainer_settings.network_settings.sensor_encoders is not None:
+                    beta = float(self.trainer_settings.network_settings.sensor_encoders.defaults.beta)
+                    onpolicy_weight = float(self.trainer_settings.network_settings.sensor_encoders.defaults.onpolicy_reconstruction_weight)
+                from mlagents.trainers.sensor_encoders.vae import VectorVAE
+                loss_type = "mse"
+                huber_delta = 1.0
+                if hasattr(self.trainer_settings.network_settings, "sensor_encoders") and self.trainer_settings.network_settings.sensor_encoders is not None:
+                    loss_type = str(self.trainer_settings.network_settings.sensor_encoders.defaults.reconstruction_loss)
+                    huber_delta = float(self.trainer_settings.network_settings.sensor_encoders.defaults.huber_delta)
+                aux_loss, recon_loss, kl = VectorVAE.loss_function(
+                    recon,
+                    vec,
+                    mu,
+                    logvar,
+                    beta,
+                    loss_type=loss_type,
+                    huber_delta=huber_delta,
+                )
+                aux_loss = aux_loss * onpolicy_weight
+                aux_total = aux_loss if aux_total is None else aux_total + aux_loss
+            if aux_total is not None:
+                loss = loss + aux_total
+        except Exception:
+            # Fail-safe: don't break PPO update if aux computation fails for some reason
+            pass
+
         # Set optimizer learning rate
         ModelUtils.update_learning_rate(self.optimizer, decay_lr)
         self.optimizer.zero_grad()

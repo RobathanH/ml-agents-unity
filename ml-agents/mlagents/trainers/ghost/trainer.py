@@ -20,6 +20,7 @@ from mlagents.trainers.behavior_id_utils import (
     create_name_behavior_id,
 )
 from mlagents.trainers.training_status import GlobalTrainingStatus, StatusType
+from mlagents.trainers.sensor_encoders.manager import VAESensorManager
 
 
 logger = get_logger(__name__)
@@ -119,6 +120,8 @@ class GhostTrainer(Trainer):
         self.current_policy_snapshot: Dict[str, List[float]] = {}
 
         self.snapshot_counter: int = 0
+        # Optional VAE manager owned by wrapped trainer if configured
+        self._vae_manager: Optional[VAESensorManager] = None
 
         # wrapped_training_team and learning team need to be separate
         # in the situation where new agents are created destroyed
@@ -245,6 +248,10 @@ class GhostTrainer(Trainer):
                 try:
                     for _ in range(trajectory_queue.qsize()):
                         t = trajectory_queue.get_nowait()
+                        # Feed observations to VAE manager on non-learning team too
+                        if self.trainer._vae_manager is not None:
+                            for step in t.steps:
+                                self.trainer._vae_manager.push_observations(step.obs)
                         # count ghost steps
                         self.ghost_step += len(t.steps)
                 except AgentManagerQueue.Empty:
@@ -478,3 +485,5 @@ class GhostTrainer(Trainer):
                 parsed_behavior_id.brain_name
             ] = internal_trajectory_queue
             self.trainer.subscribe_trajectory_queue(internal_trajectory_queue)
+        # Note: We still want to ingest opponent (non-learning team) observations for VAE training.
+        # We'll do that in advance() where we drain non-learning trajectories.

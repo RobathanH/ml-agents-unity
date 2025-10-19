@@ -3,7 +3,7 @@
 # Contains an implementation of PPO as described in: https://arxiv.org/abs/1707.06347
 
 from collections import defaultdict
-from typing import cast
+from typing import cast, Optional
 
 import numpy as np
 
@@ -14,6 +14,8 @@ from mlagents.trainers.policy import Policy
 from mlagents.trainers.optimizer.torch_optimizer import TorchOptimizer
 from mlagents.trainers.behavior_id_utils import BehaviorIdentifiers
 from mlagents.trainers.settings import TrainerSettings, OnPolicyHyperparamSettings
+from mlagents.trainers.sensor_encoders.manager import VAESensorManager
+from mlagents_envs.logging_util import get_logger
 
 logger = get_logger(__name__)
 
@@ -55,6 +57,7 @@ class OnPolicyTrainer(RLTrainer):
         self.seed = seed
         self.policy: Policy = None  # type: ignore
         self.optimizer: TorchOptimizer = None  # type: ignore
+        self._vae_manager: Optional[VAESensorManager] = None
 
     def _is_ready_update(self):
         """
@@ -142,3 +145,15 @@ class OnPolicyTrainer(RLTrainer):
 
         # Needed to resume loads properly
         self._step = policy.get_current_step()
+
+        # Initialize VAE manager if enabled and not already created
+        se = self.trainer_settings.network_settings.sensor_encoders
+        if se is not None and se.enabled and self._vae_manager is None:
+            # Build VAE manager with current behavior's observation specs
+            self._vae_manager = VAESensorManager(
+                parsed_behavior_id.brain_name, se, self.policy.behavior_spec.observation_specs
+            )
+            # Note: Policy encoders are already constructed; the manager coordinates training only.
+            logger.info(
+                f"[VAE] Sensor encoders enabled for behavior '{parsed_behavior_id.brain_name}' (manager initialized)."
+            )
