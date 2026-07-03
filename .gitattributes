@@ -5,3 +5,4 @@
 */CommunicatorObjects/* binary
 */communicator_objects/* binary
 *.md text
+*.sh text eol=lf
