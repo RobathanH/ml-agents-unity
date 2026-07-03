@@ -166,6 +166,81 @@ class SensorEncodersSettings:
     sensors: List[SensorEncoderOverride] = attr.ib(factory=list)
 
 
+# NEW VAE-specific settings ####################################################
+@attr.s(auto_attribs=True)
+class VAESensorEncoderDefaults:
+    hidden_layers: int = 2
+    hidden_size: Any = "auto"
+    beta: float = 1.0
+    lr: float = 1.0e-3
+    batch_size: int = 256
+    buffer_size: int = 500000
+    normalize: bool = True
+    offpolicy_reconstruction: bool = True
+    onpolicy_reconstruction_weight: float = 0.1
+    reconstruction_loss: str = "smooth_l1"
+    huber_delta: float = 1.0
+
+
+@attr.s(auto_attribs=True)
+class VAESensorEncoderOverride:
+    name: str = attr.ib()
+    latent_size: Optional[int] = None
+    hidden_layers: Optional[int] = None
+    hidden_size: Optional[int] = None
+    beta: Optional[float] = None
+    lr: Optional[float] = None
+    batch_size: Optional[int] = None
+    buffer_size: Optional[int] = None
+    normalize: Optional[bool] = None
+    offpolicy_reconstruction: Optional[bool] = None
+    onpolicy_reconstruction_weight: Optional[float] = None
+    reconstruction_loss: Optional[str] = None
+    huber_delta: Optional[float] = None
+
+
+@attr.s(auto_attribs=True)
+class VAESensorEncodersSettings:
+    enabled: bool = False
+    auto: bool = True
+    apply_to_types: List[str] = attr.ib(factory=lambda: ["vector"])  # vectors only
+    latent_proportion: float = 0.25
+    min_latent_size: int = 16
+    max_latent_size: int = 128
+    defaults: VAESensorEncoderDefaults = attr.ib(factory=VAESensorEncoderDefaults)
+    sensors: List[VAESensorEncoderOverride] = attr.ib(factory=list)
+
+
+# NEW EGNN-specific settings ###################################################
+@attr.s(auto_attribs=True)
+class EGNNSensorEncoderDefaults:
+    hidden_dim: int = 128
+    message_dim: int = 64
+    num_layers: int = 3
+    k_neighbors: int = 8
+    pos_dim: int = 3
+    embedding_size: int = 128
+
+
+@attr.s(auto_attribs=True)
+class EGNNSensorEncoderOverride:
+    name: str = attr.ib()
+    hidden_dim: Optional[int] = None
+    message_dim: Optional[int] = None
+    num_layers: Optional[int] = None
+    k_neighbors: Optional[int] = None
+    pos_dim: Optional[int] = None
+    embedding_size: Optional[int] = None
+
+
+@attr.s(auto_attribs=True)
+class EGNNSensorEncodersSettings:
+    enabled: bool = False
+    auto: bool = True  # applies only to sensors with names matching EGNN convention
+    defaults: EGNNSensorEncoderDefaults = attr.ib(factory=EGNNSensorEncoderDefaults)
+    sensors: List[EGNNSensorEncoderOverride] = attr.ib(factory=list)
+
+
 @attr.s(auto_attribs=True)
 class NetworkSettings:
     @attr.s
@@ -191,7 +266,10 @@ class NetworkSettings:
     memory: Optional[MemorySettings] = None
     goal_conditioning_type: ConditioningType = ConditioningType.HYPER
     deterministic: bool = parser.get_default("deterministic")
-    # Optional sensor encoder configuration (e.g., VAEs) applied to observations
+    # Optional sensor encoder configurations
+    vae_encoders: Optional[VAESensorEncodersSettings] = None
+    egnn_encoders: Optional[EGNNSensorEncodersSettings] = None
+    # Backward compatibility (deprecated): when provided, interpret as VAE encoders settings
     sensor_encoders: Optional[SensorEncodersSettings] = None
 
 

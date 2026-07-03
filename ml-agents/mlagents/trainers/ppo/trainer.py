@@ -18,7 +18,10 @@ from mlagents.trainers.ppo.optimizer_torch import TorchPPOOptimizer, PPOSettings
 from mlagents.trainers.trajectory import Trajectory
 from mlagents.trainers.behavior_id_utils import BehaviorIdentifiers
 from mlagents.trainers.settings import TrainerSettings
-from mlagents.trainers.sensor_encoders.manager import VAESensorManager
+from mlagents.trainers.sensor_encoders.manager import (
+    VAESensorManager,
+    build_egnn_registry,
+)
 
 from mlagents.trainers.torch_entities.networks import SimpleActor, SharedActorCritic
 
@@ -179,22 +182,37 @@ class PPOTrainer(OnPolicyTrainer):
         :param behavior_spec: specifications for policy construction
         :return policy
         """
-        # If sensor encoders are enabled, ensure a manager exists and attach its registry
-        se = self.trainer_settings.network_settings.sensor_encoders
+        # Build registry from new-style configs first (VAE + EGNN), then fallback to legacy
+        registry = {}
+        ns = self.trainer_settings.network_settings
+        # VAE encoders
+        if getattr(ns, "vae_encoders", None) is not None and ns.vae_encoders.enabled:
+            if self._vae_manager is None:
+                self._vae_manager = VAESensorManager(
+                    parsed_behavior_id.brain_name, ns.vae_encoders, behavior_spec.observation_specs
+                )
+            registry.update(self._vae_manager.registry_for_utils())
+        # Legacy single block
+        se = getattr(ns, "sensor_encoders", None)
         if se is not None and se.enabled:
             if self._vae_manager is None:
                 self._vae_manager = VAESensorManager(
                     parsed_behavior_id.brain_name, se, behavior_spec.observation_specs
                 )
-            registry = self._vae_manager.registry_for_utils()
-            setattr(
-                self.trainer_settings.network_settings,
-                "_sensor_encoder_registry",
-                registry,
+            registry.update(self._vae_manager.registry_for_utils())
+        # EGNN encoders: built fresh per policy (not cached on the trainer) so that
+        # self-play ghost policies get their own module instances instead of
+        # aliasing the learning policy's weights.
+        eg = getattr(ns, "egnn_encoders", None)
+        if eg is not None and eg.enabled:
+            registry.update(
+                build_egnn_registry(
+                    parsed_behavior_id.brain_name, eg, behavior_spec.observation_specs
+                )
             )
-            logger.info(
-                f"[VAE] Injecting {len(registry)} sensor encoder(s) into policy build for '{parsed_behavior_id.brain_name}'."
-            )
+        if len(registry) > 0:
+            setattr(self.trainer_settings.network_settings, "_sensor_encoder_registry", registry)
+            logger.info(f"[Encoders] Injecting {len(registry)} sensor encoder(s) into policy build for '{parsed_behavior_id.brain_name}'.")
         actor_cls: Union[Type[SimpleActor], Type[SharedActorCritic]] = SimpleActor
         actor_kwargs: Dict[str, Any] = {
             "conditional_sigma": False,

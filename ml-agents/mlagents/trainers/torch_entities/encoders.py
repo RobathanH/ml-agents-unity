@@ -152,6 +152,31 @@ class VAEVectorInput(nn.Module):
             self.normalizer.update(inputs)
 
 
+class EGNNEntityEncoder(nn.Module):
+    """
+    Processor for variable-length entity observations that applies an EGNN to produce
+    per-entity embeddings. For pooling and attention, callers should use existing
+    attention mechanisms; this module only transforms entity features.
+    """
+
+    def __init__(
+        self,
+        input_entity_size: int,
+        egnn: nn.Module,
+        stop_gradient: bool = True,
+    ):
+        super().__init__()
+        self.egnn = egnn
+        self._stop_gradient = stop_gradient
+
+    def forward(self, entities: torch.Tensor) -> torch.Tensor:
+        # entities: [B, N, D]
+        embeddings = self.egnn(entities)
+        if self._stop_gradient:
+            embeddings = embeddings.detach()
+        return embeddings
+
+
 class FullyConnectedVisualEncoder(nn.Module):
     def __init__(
         self, height: int, width: int, initial_channels: int, output_size: int

@@ -5,11 +5,90 @@ from mlagents.torch_utils import torch
 from mlagents_envs.logging_util import get_logger
 
 from mlagents.trainers.sensor_encoders.vae import VectorVAE
+from mlagents.trainers.sensor_encoders.egnn import EGNNEncoder
 from mlagents.trainers.sensor_encoders.buffers import RingBuffer
-from mlagents.trainers.settings import SensorEncodersSettings
+from mlagents.trainers.settings import (
+    SensorEncodersSettings,
+    EGNNSensorEncodersSettings,
+)
 
 
 logger = get_logger(__name__)
+
+# Must match ObservationEncoder.ATTENTION_EMBEDDING_SIZE: per-entity embeddings
+# from variable-length processors feed directly into the fixed-size RSA block.
+RSA_EMBEDDING_SIZE = 128
+
+
+def build_egnn_registry(
+    behavior_name: str,
+    settings: EGNNSensorEncodersSettings,
+    observation_specs: List[Any],
+) -> Dict[str, Any]:
+    """
+    Builds EGNN encoder modules for variable-length (BufferSensor) observations from
+    the egnn_encoders block of NetworkSettings. Returns a registry mapping sensor
+    name -> config consumable by ModelUtils.get_encoder_for_obs.
+
+    Modules are created fresh on every call so that separately constructed policies
+    (e.g. self-play ghost policies) never share parameters.
+    """
+    registry: Dict[str, Any] = {}
+    for spec in observation_specs:
+        name = getattr(spec, "name", None)
+        if not name:
+            continue
+        shape = spec.shape
+        if len(shape) != 2 or "variable" not in str(spec.dimension_property).lower():
+            continue
+        override = next((s for s in settings.sensors if s.name == name), None)
+        if override is None and not (settings.auto and "egnn" in name.lower()):
+            continue
+
+        def pick(field: str) -> Any:
+            if override is not None and getattr(override, field, None) is not None:
+                return getattr(override, field)
+            return getattr(settings.defaults, field)
+
+        embedding_size = int(pick("embedding_size"))
+        if embedding_size != RSA_EMBEDDING_SIZE:
+            logger.warning(
+                f"[EGNN] embedding_size={embedding_size} for sensor '{name}' is not supported: "
+                f"the attention block expects {RSA_EMBEDDING_SIZE}. Using {RSA_EMBEDDING_SIZE}."
+            )
+            embedding_size = RSA_EMBEDDING_SIZE
+        egnn = EGNNEncoder(
+            input_dim=int(shape[1]),
+            embedding_size=embedding_size,
+            hidden_dim=int(pick("hidden_dim")),
+            message_dim=int(pick("message_dim")),
+            num_layers=int(pick("num_layers")),
+            k_neighbors=int(pick("k_neighbors")),
+            pos_dim=int(pick("pos_dim")),
+            max_entities=int(shape[0]),
+        )
+        registry[name] = {
+            "module": egnn,
+            "latent_size": embedding_size,
+            "normalize": False,
+            # Trained on-policy as part of the actor network
+            "stop_gradient": False,
+            "egnn": True,
+        }
+        logger.info(
+            f"[EGNN] Built encoder for sensor '{name}' on behavior '{behavior_name}': "
+            f"max_entities={shape[0]}, entity_size={shape[1]}, pos_dim={int(pick('pos_dim'))}, "
+            f"k_neighbors={int(pick('k_neighbors'))}, num_layers={int(pick('num_layers'))}, "
+            f"hidden_dim={int(pick('hidden_dim'))}, message_dim={int(pick('message_dim'))}, "
+            f"embedding_size={embedding_size}"
+        )
+    if not registry:
+        logger.warning(
+            f"[EGNN] egnn_encoders enabled for behavior '{behavior_name}' but no matching "
+            f"variable-length sensors were found (auto={settings.auto}, "
+            f"overrides={[s.name for s in settings.sensors]})."
+        )
+    return registry
 
 
 class VAESensorManager:
@@ -31,6 +110,8 @@ class VAESensorManager:
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
         self.buffers: Dict[str, RingBuffer] = {}
         self.meta: Dict[str, Dict[str, Any]] = {}
+        # EGNN registry (no off-policy training loop here; trained on-policy only or frozen)
+        self.egnn_modules: Dict[str, EGNNEncoder] = {}
 
         # Preserve observation order of names to align incoming obs arrays
         self.spec_names: List[str] = [getattr(spec, "name", "") for spec in observation_specs]
@@ -52,6 +133,36 @@ class VAESensorManager:
             else:
                 if "VectorSensor" in name:
                     continue
+            # Handle variable-length entity specs (BufferSensor): shape = [max_entities, entity_size]
+            if len(shape) == 2 and "variable" in str(dim_prop).lower():
+                # EGNN support now reads from egnn_encoders settings on NetworkSettings. If invoked here,
+                # we only auto-include when legacy settings are in use and name implies EGNN.
+                override = next((s for s in getattr(self.settings, "sensors", []) if s.name == name), None)
+                if override is None and not (getattr(self.settings, "auto", False) and isinstance(name, str) and ("egnn" in name.lower())):
+                    continue
+                entity_size = int(shape[1])
+                # Reasonable EGNN defaults (legacy): NOTE embedding size used for attention is 128
+                egnn = EGNNEncoder(
+                    input_dim=entity_size,
+                    embedding_size=128,
+                    hidden_dim=128,
+                    message_dim=64,
+                    num_layers=3,
+                    k_neighbors=8,
+                    pos_dim=3,
+                    max_entities=int(shape[0]),
+                ).to(self.device)
+                self.egnn_modules[name] = egnn
+                self.meta[name] = {
+                    "latent_size": 128,
+                    "normalize": False,
+                    "stop_gradient": True,
+                    "egnn": True,
+                }
+                built_count += 1
+                included_names.append(name)
+                continue
+            # Vector encoders (VAE)
             if len(shape) != 1:
                 continue
             if "vector" not in self.settings.apply_to_types:
@@ -132,6 +243,15 @@ class VAESensorManager:
                 "latent_size": self.meta[name]["latent_size"],
                 "normalize": self.meta[name]["normalize"],
                 "stop_gradient": self.meta[name]["stop_gradient"],
+            }
+        # Add EGNN modules under same registry interface
+        for name, egnn in self.egnn_modules.items():
+            reg[name] = {
+                "module": egnn,
+                "latent_size": self.meta[name]["latent_size"],
+                "normalize": False,
+                "stop_gradient": self.meta[name]["stop_gradient"],
+                "egnn": True,
             }
         return reg
 

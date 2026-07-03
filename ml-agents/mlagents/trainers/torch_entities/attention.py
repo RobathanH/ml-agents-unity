@@ -243,8 +243,13 @@ class ResidualSelfAttention(torch.nn.Module):
         key = self.fc_k(inp)  # (b, n_k, emb)
         value = self.fc_v(inp)  # (b, n_k, emb)
 
-        # Only use max num if provided
-        if self.max_num_ent is not None:
+        # At runtime, always use actual entity count to avoid shape mismatch; enforce max only for export
+        if exporting_to_onnx.is_exporting():
+            if self.max_num_ent is None:
+                raise UnityTrainerException(
+                    "Trying to export an attention mechanism that doesn't have a set max \
+                    number of elements."
+                )
             num_ent = self.max_num_ent
         else:
             num_ent = inp.shape[1]
@@ -263,3 +268,27 @@ class ResidualSelfAttention(torch.nn.Module):
         denominator = torch.sum(1 - mask, dim=1, keepdim=True) + self.EPSILON
         output = numerator / denominator
         return output
+
+
+class EGNNAttentionEmbedding(EntityEmbedding):
+    """
+    An EntityEmbedding variant that uses an EGNN module to transform raw entity features
+    (e.g., from BufferSensor/EGNN Sensor) into per-entity embeddings suitable for RSA.
+    The module ignores x_self concatenation and operates on entities directly to preserve
+    SE(3)-equivariance in the learned representation.
+    """
+
+    def __init__(self, egnn_module: torch.nn.Module, embedding_size: int, entity_num_max_elements: int):
+        # Initialize base with placeholder sizes; we won't use its self_ent_encoder
+        super().__init__(
+            entity_size=embedding_size,
+            entity_num_max_elements=entity_num_max_elements,
+            embedding_size=embedding_size,
+        )
+        self.egnn = egnn_module
+        self.embedding_size = embedding_size
+
+    def forward(self, x_self: torch.Tensor, entities: torch.Tensor) -> torch.Tensor:
+        # entities: [B, N, D_in], return [B, N, embedding_size]
+        with torch.set_grad_enabled(self.training):
+            return self.egnn(entities)

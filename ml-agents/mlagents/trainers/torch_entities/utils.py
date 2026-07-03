@@ -11,11 +11,13 @@ from mlagents.trainers.torch_entities.encoders import (
     FullyConnectedVisualEncoder,
     VectorInput,
     VAEVectorInput,
+    EGNNEntityEncoder,
 )
 from mlagents.trainers.settings import EncoderType, ScheduleType
 from mlagents.trainers.torch_entities.attention import (
     EntityEmbedding,
     ResidualSelfAttention,
+    EGNNAttentionEmbedding,
 )
 from mlagents.trainers.exception import UnityTrainerException
 from mlagents_envs.base_env import ObservationSpec, DimensionProperty
@@ -184,10 +186,27 @@ class ModelUtils:
             return (VectorInput(shape[0], normalize), shape[0])
         # VARIABLE LENGTH
         if dim_prop in ModelUtils.VALID_VAR_LEN_PROP:
+            # If a special EGNN encoder is provided for this sensor name, wrap it; else default to EntityEmbedding
+            if sensor_encoder_registry is not None and obs_spec.name in sensor_encoder_registry:
+                enc_cfg = sensor_encoder_registry[obs_spec.name]
+                if enc_cfg.get("egnn", False):
+                    egnn_module = enc_cfg["module"]
+                    # Determine embedding size from module if available, fall back to attention_embedding_size
+                    emb_size: int = int(getattr(egnn_module, "embedding_size", attention_embedding_size))
+                    return (
+                        EGNNAttentionEmbedding(
+                            egnn_module=egnn_module,
+                            embedding_size=emb_size,
+                            entity_num_max_elements=shape[0],
+                        ),
+                        0,
+                    )
+            # If this sensor appears to be an EGNN sensor by name and auto mode is on, allow fallback registry-less path
+            # by treating the variable-length obs as generic entities (EntityEmbedding). If users want EGNN, configure override or enable auto.
             return (
                 EntityEmbedding(
                     entity_size=shape[1],
-                    entity_num_max_elements=shape[0],
+                    entity_num_max_elements=max(1, shape[0]),
                     embedding_size=attention_embedding_size,
                 ),
                 0,
