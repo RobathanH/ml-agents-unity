@@ -27,7 +27,10 @@ if tmux has-session -t train 2>/dev/null; then
 fi
 
 mkdir -p "$REPO/results"
-CMD="source $HOME/venv/bin/activate && cd $REPO && mlagents-learn config/ppo/CrawlerSumoEGNN.yaml \
+# xvfb-run: the Unity Linux player SIGSEGVs on headless hosts without a display
+# server (NULL strcasecmp in display probing), even with -nographics. A virtual
+# X display fixes it; all env worker subprocesses inherit it from the trainer.
+CMD="source $HOME/venv/bin/activate && cd $REPO && xvfb-run -a mlagents-learn config/ppo/CrawlerSumoEGNN.yaml \
  --env $ENV_BIN --run-id $RUN_ID --num-envs $NUM_ENVS --no-graphics --torch-device cuda \
  ${EXTRA_ARGS[*]:-} 2>&1 | tee -a $REPO/results/${RUN_ID}_console.log"
 

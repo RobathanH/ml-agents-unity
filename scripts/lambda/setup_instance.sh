@@ -15,7 +15,9 @@ if [ "$PYVER" != "3.10" ]; then
 fi
 
 sudo apt-get update -y
-sudo apt-get install -y python3-venv python3-pip unzip tmux htop
+# xvfb: Unity Linux players crash (SIGSEGV) on hosts with no display server,
+# even with -nographics -- training runs under xvfb-run.
+sudo apt-get install -y python3-venv python3-pip unzip tmux htop xvfb
 
 if [ ! -d "$HOME/ml-agents" ]; then
     git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$HOME/ml-agents"

@@ -32,7 +32,21 @@ public static class TrainingBuilds
             "CrawlerSumo.x86_64");
     }
 
-    static void BuildLinux(string scenePath, string outDirName, string executableName)
+    [MenuItem("Training/Build CrawlerSumoEGNN (Linux Dedicated Server)")]
+    public static void BuildCrawlerSumoEGNNLinuxServer()
+    {
+        BuildLinux(
+            "Assets/CrawlerSumo/Scenes/CrawlerSumoEGNN.unity",
+            "CrawlerSumoEGNN_linux_server",
+            "CrawlerSumoEGNN.x86_64",
+            StandaloneBuildSubtarget.Server);
+    }
+
+    static void BuildLinux(
+        string scenePath,
+        string outDirName,
+        string executableName,
+        StandaloneBuildSubtarget subtarget = StandaloneBuildSubtarget.Player)
     {
         try
         {
@@ -40,11 +54,13 @@ public static class TrainingBuilds
                 Path.Combine(Application.dataPath, "..", "..", "envs", outDirName));
             Directory.CreateDirectory(outDir);
 
+            EditorUserBuildSettings.standaloneBuildSubtarget = subtarget;
             var options = new BuildPlayerOptions
             {
                 scenes = new[] { scenePath },
                 locationPathName = Path.Combine(outDir, executableName),
                 target = BuildTarget.StandaloneLinux64,
+                subtarget = (int)subtarget,
                 options = BuildOptions.None,
             };
 
