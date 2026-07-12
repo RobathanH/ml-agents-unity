@@ -7,12 +7,14 @@
 set -euo pipefail
 
 RUN_ID="${1:?usage: launch_training.sh <run-id> [num-envs] [extra args...]}"
-NUM_ENVS="${2:-12}"
+NUM_ENVS="${2:-8}"
 shift $(( $# >= 2 ? 2 : 1 ))
 EXTRA_ARGS=("$@")
 
 REPO="$HOME/ml-agents"
-ENV_BIN="$REPO/envs/CrawlerSumoEGNN_linux/CrawlerSumoEGNN.x86_64"
+# Multi-arena build by default (12 arenas/process -> batched policy inference).
+# Override with ENV_BIN=... for the single-arena build.
+ENV_BIN="${ENV_BIN:-$REPO/envs/CrawlerSumoEGNN_Multi_linux/CrawlerSumoEGNN.x86_64}"
 
 if [ ! -f "$ENV_BIN" ]; then
     echo "ERROR: $ENV_BIN not found. Upload the Linux build first."

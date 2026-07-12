@@ -55,6 +55,10 @@ def set_torch_config(torch_settings: TorchSettings) -> None:
         torch.set_default_device(_device.type)
         torch.set_default_dtype(torch.float32)
     else:
+        # Reset in case a previous call (e.g. the import-time auto-detect below)
+        # set the default device to cuda; otherwise new tensors land on cuda
+        # while the policy lives on cpu.
+        torch.set_default_device("cpu")
         torch.set_default_dtype(torch.float32)
     logger.debug(f"default Torch device: {_device}")
 

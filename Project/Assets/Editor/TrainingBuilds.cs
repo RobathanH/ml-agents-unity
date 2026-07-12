@@ -2,51 +2,128 @@ using System;
 using System.IO;
 using UnityEditor;
 using UnityEditor.Build.Reporting;
+using UnityEditor.SceneManagement;
 using UnityEngine;
 
 /// <summary>
 /// Command-line friendly builds of training environments.
 /// Invoke from CLI:
 ///   Unity.exe -projectPath <Project> -batchmode -nographics
-///            -executeMethod TrainingBuilds.BuildCrawlerSumoEGNNLinux
-///            -logFile <log path>
-/// Output goes to <repo>/envs/<name>_linux/ next to the existing Windows training builds.
+///            -executeMethod TrainingBuilds.<Method> -logFile <log path>
+/// Output goes to <repo>/envs/<name>/ next to the existing training builds.
 /// </summary>
 public static class TrainingBuilds
 {
+    const string EgnnScenePath = "Assets/CrawlerSumo/Scenes/CrawlerSumoEGNN.unity";
+    const string EgnnMultiScenePath = "Assets/CrawlerSumo/Scenes/CrawlerSumoEGNN_Multi.unity";
+    const string EgnnPrefabPath = "Assets/CrawlerSumo/Prefabs/CrawlerSumoEGNNEnv.prefab";
+    const int MultiArenaCount = 12;
+    const float ArenaSpacing = 250f;
+
     [MenuItem("Training/Build CrawlerSumoEGNN (Linux x86_64)")]
     public static void BuildCrawlerSumoEGNNLinux()
     {
-        BuildLinux(
-            "Assets/CrawlerSumo/Scenes/CrawlerSumoEGNN.unity",
-            "CrawlerSumoEGNN_linux",
-            "CrawlerSumoEGNN.x86_64");
-    }
-
-    [MenuItem("Training/Build CrawlerSumo (Linux x86_64)")]
-    public static void BuildCrawlerSumoLinux()
-    {
-        BuildLinux(
-            "Assets/CrawlerSumo/Scenes/CrawlerSumo.unity",
-            "CrawlerSumo_linux",
-            "CrawlerSumo.x86_64");
+        ExitIfBatch(BuildTo(
+            EgnnScenePath, "CrawlerSumoEGNN_linux", "CrawlerSumoEGNN.x86_64",
+            BuildTarget.StandaloneLinux64, StandaloneBuildSubtarget.Player));
     }
 
     [MenuItem("Training/Build CrawlerSumoEGNN (Linux Dedicated Server)")]
     public static void BuildCrawlerSumoEGNNLinuxServer()
     {
-        BuildLinux(
-            "Assets/CrawlerSumo/Scenes/CrawlerSumoEGNN.unity",
-            "CrawlerSumoEGNN_linux_server",
-            "CrawlerSumoEGNN.x86_64",
-            StandaloneBuildSubtarget.Server);
+        ExitIfBatch(BuildTo(
+            EgnnScenePath, "CrawlerSumoEGNN_linux_server", "CrawlerSumoEGNN.x86_64",
+            BuildTarget.StandaloneLinux64, StandaloneBuildSubtarget.Server));
     }
 
-    static void BuildLinux(
+    /// <summary>
+    /// Generates the multi-arena variant of the EGNN scene (saved as a new scene
+    /// asset, original untouched) and builds it for Windows for local validation.
+    /// </summary>
+    [MenuItem("Training/Create Multi-Arena Scene + Build Windows")]
+    public static void CreateMultiArenaAndBuildWindows()
+    {
+        bool ok = CreateMultiArenaScene()
+            && BuildTo(
+                EgnnMultiScenePath, "CrawlerSumoEGNN_Multi_win", "UnityEnvironment.exe",
+                BuildTarget.StandaloneWindows64, StandaloneBuildSubtarget.Player);
+        ExitIfBatch(ok);
+    }
+
+    [MenuItem("Training/Build Multi-Arena EGNN (Linux x86_64)")]
+    public static void BuildCrawlerSumoEGNNMultiLinux()
+    {
+        ExitIfBatch(BuildTo(
+            EgnnMultiScenePath, "CrawlerSumoEGNN_Multi_linux", "CrawlerSumoEGNN.x86_64",
+            BuildTarget.StandaloneLinux64, StandaloneBuildSubtarget.Player));
+    }
+
+    static bool CreateMultiArenaScene()
+    {
+        try
+        {
+            var scene = EditorSceneManager.OpenScene(EgnnScenePath, OpenSceneMode.Single);
+            var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(EgnnPrefabPath);
+            if (prefab == null)
+            {
+                Debug.LogError($"Prefab not found at {EgnnPrefabPath}");
+                return false;
+            }
+
+            GameObject original = null;
+            foreach (var root in scene.GetRootGameObjects())
+            {
+                if (PrefabUtility.GetCorrespondingObjectFromSource(root) == prefab)
+                {
+                    original = root;
+                    break;
+                }
+            }
+            if (original == null)
+            {
+                Debug.LogError("No CrawlerSumoEGNNEnv prefab instance found in scene");
+                return false;
+            }
+
+            var baseCtrl = original.GetComponentInChildren<CrawlerSumoEnvController>(true);
+            if (baseCtrl == null)
+            {
+                Debug.LogError("No CrawlerSumoEnvController found on arena instance");
+                return false;
+            }
+
+            for (int i = 1; i < MultiArenaCount; i++)
+            {
+                // 4-wide grid, 250 units apart -- platforms (r=15) can never interact
+                var offset = new Vector3((i % 4) * ArenaSpacing, 0f, (i / 4) * ArenaSpacing);
+                var clone = (GameObject)PrefabUtility.InstantiatePrefab(prefab, scene);
+                clone.name = $"{original.name}_{i}";
+                clone.transform.position = original.transform.position + offset;
+
+                var ctrl = clone.GetComponentInChildren<CrawlerSumoEnvController>(true);
+                // platformCenter is an absolute world position -- shift per arena
+                ctrl.platformCenter = baseCtrl.platformCenter + offset;
+                ctrl.platformRadius = baseCtrl.platformRadius;
+                ctrl.fallY = baseCtrl.fallY;
+            }
+
+            bool saved = EditorSceneManager.SaveScene(scene, EgnnMultiScenePath);
+            Debug.Log($"Multi-arena scene ({MultiArenaCount} arenas) saved: {saved} -> {EgnnMultiScenePath}");
+            return saved;
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"CreateMultiArenaScene threw: {e}");
+            return false;
+        }
+    }
+
+    static bool BuildTo(
         string scenePath,
         string outDirName,
         string executableName,
-        StandaloneBuildSubtarget subtarget = StandaloneBuildSubtarget.Player)
+        BuildTarget target,
+        StandaloneBuildSubtarget subtarget)
     {
         try
         {
@@ -59,7 +136,7 @@ public static class TrainingBuilds
             {
                 scenes = new[] { scenePath },
                 locationPathName = Path.Combine(outDir, executableName),
-                target = BuildTarget.StandaloneLinux64,
+                target = target,
                 subtarget = (int)subtarget,
                 options = BuildOptions.None,
             };
@@ -68,30 +145,27 @@ public static class TrainingBuilds
             var summary = report.summary;
             if (summary.result != BuildResult.Succeeded)
             {
-                Debug.LogError(
-                    $"Build FAILED: {summary.result}, errors={summary.totalErrors}");
-                if (Application.isBatchMode)
-                {
-                    EditorApplication.Exit(1);
-                }
-                return;
+                Debug.LogError($"Build FAILED: {summary.result}, errors={summary.totalErrors}");
+                return false;
             }
 
             Debug.Log(
                 $"Build succeeded: {summary.outputPath} " +
                 $"({summary.totalSize / (1024 * 1024)} MB, {summary.totalTime.TotalMinutes:F1} min)");
-            if (Application.isBatchMode)
-            {
-                EditorApplication.Exit(0);
-            }
+            return true;
         }
         catch (Exception e)
         {
             Debug.LogError($"Build threw: {e}");
-            if (Application.isBatchMode)
-            {
-                EditorApplication.Exit(1);
-            }
+            return false;
+        }
+    }
+
+    static void ExitIfBatch(bool success)
+    {
+        if (Application.isBatchMode)
+        {
+            EditorApplication.Exit(success ? 0 : 1);
         }
     }
 }
