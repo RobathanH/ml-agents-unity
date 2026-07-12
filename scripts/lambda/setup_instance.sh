@@ -31,6 +31,12 @@ fi
 # shellcheck disable=SC1091
 source "$HOME/venv/bin/activate"
 pip install --upgrade pip
+# pip >= 25 no longer ships setuptools into venvs, and setuptools >= 82 removed
+# pkg_resources, which mlagents imports -- pin below 81.
+pip install "setuptools<81"
+# Pin torch 2.8.0: matches the locally-verified ONNX export behavior, and newer
+# cu13x wheels fail on instances whose Lambda Stack driver predates CUDA 13.
+pip install "torch==2.8.0"
 pip install -e "$HOME/ml-agents/ml-agents-envs" -e "$HOME/ml-agents/ml-agents"
 
 python - <<'EOF'

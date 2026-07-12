@@ -17,7 +17,7 @@ public static class TrainingBuilds
     const string EgnnScenePath = "Assets/CrawlerSumo/Scenes/CrawlerSumoEGNN.unity";
     const string EgnnMultiScenePath = "Assets/CrawlerSumo/Scenes/CrawlerSumoEGNN_Multi.unity";
     const string EgnnPrefabPath = "Assets/CrawlerSumo/Prefabs/CrawlerSumoEGNNEnv.prefab";
-    const int MultiArenaCount = 12;
+    const int MultiArenaCount = 32;
     const float ArenaSpacing = 250f;
 
     [MenuItem("Training/Build CrawlerSumoEGNN (Linux x86_64)")]
@@ -47,6 +47,16 @@ public static class TrainingBuilds
             && BuildTo(
                 EgnnMultiScenePath, "CrawlerSumoEGNN_Multi_win", "UnityEnvironment.exe",
                 BuildTarget.StandaloneWindows64, StandaloneBuildSubtarget.Player);
+        ExitIfBatch(ok);
+    }
+
+    /// <summary>Regenerates the multi-arena scene and builds it for Linux in one pass.</summary>
+    public static void CreateMultiArenaAndBuildLinux()
+    {
+        bool ok = CreateMultiArenaScene()
+            && BuildTo(
+                EgnnMultiScenePath, "CrawlerSumoEGNN_Multi_linux", "CrawlerSumoEGNN.x86_64",
+                BuildTarget.StandaloneLinux64, StandaloneBuildSubtarget.Player);
         ExitIfBatch(ok);
     }
 

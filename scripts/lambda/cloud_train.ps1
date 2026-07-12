@@ -27,7 +27,11 @@ param(
     [string]$InstanceName = "unity-rl-train",
     [switch]$Resume
 )
-$ErrorActionPreference = "Stop"
+# NOTE: "Continue" not "Stop" -- in PowerShell 5.1 any native-command stderr
+# (e.g. ssh host-key notices) becomes a NativeCommandError that would kill the
+# script under Stop. Failures are checked explicitly via $LASTEXITCODE and
+# -ErrorAction Stop on the REST calls.
+$ErrorActionPreference = "Continue"
 $Api = "https://cloud.lambdalabs.com/api/v1"
 $ApiKey = (Get-Content $ApiKeyFile -Raw).Trim()
 $Headers = @{ Authorization = "Bearer $ApiKey" }
@@ -35,18 +39,19 @@ if (-not $BuildTgz) { $BuildTgz = Join-Path $PSScriptRoot "..\..\envs\CrawlerSum
 if (-not (Test-Path $BuildTgz)) { throw "Build archive not found: $BuildTgz" }
 
 function Invoke-Ssh([string]$ip, [string]$cmd) {
-    ssh -i $KeyFile -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "ubuntu@$ip" $cmd
+    ssh -i $KeyFile -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=15 "ubuntu@$ip" $cmd 2>&1 |
+        ForEach-Object { "$_" }
     if ($LASTEXITCODE -ne 0) { throw "ssh command failed (exit $LASTEXITCODE): $cmd" }
 }
 
 # --- 1. SSH key name registered with Lambda ---
-$sshKeys = (Invoke-RestMethod "$Api/ssh-keys" -Headers $Headers).data
+$sshKeys = (Invoke-RestMethod "$Api/ssh-keys" -Headers $Headers -ErrorAction Stop).data
 if (-not $sshKeys) { throw "No SSH keys registered in your Lambda account" }
 $sshKeyName = $sshKeys[0].name
 Write-Host "Using Lambda SSH key: $sshKeyName"
 
 # --- 2. Pick a region with capacity ---
-$types = (Invoke-RestMethod "$Api/instance-types" -Headers $Headers).data
+$types = (Invoke-RestMethod "$Api/instance-types" -Headers $Headers -ErrorAction Stop).data
 $entry = $types.$InstanceType
 if (-not $entry) { throw "Unknown instance type '$InstanceType'. Available: $($types.PSObject.Properties.Name -join ', ')" }
 $regions = @($entry.regions_with_capacity_available)
@@ -62,7 +67,7 @@ Write-Host "Launching $InstanceType in $region (`$$price/hr, limit $TimeLimitHou
 # --- 3. Launch ---
 $body = @{ region_name = $region; instance_type_name = $InstanceType;
            ssh_key_names = @($sshKeyName); name = $InstanceName } | ConvertTo-Json
-$launch = Invoke-RestMethod "$Api/instance-operations/launch" -Method Post -Headers $Headers -ContentType "application/json" -Body $body
+$launch = Invoke-RestMethod "$Api/instance-operations/launch" -Method Post -Headers $Headers -ContentType "application/json" -Body $body -ErrorAction Stop
 $instanceId = $launch.data.instance_ids[0]
 Write-Host "Instance launched: $instanceId"
 
@@ -70,7 +75,7 @@ Write-Host "Instance launched: $instanceId"
 $ip = $null
 for ($i = 0; $i -lt 48; $i++) {
     Start-Sleep -Seconds 15
-    $inst = (Invoke-RestMethod "$Api/instances/$instanceId" -Headers $Headers).data
+    $inst = (Invoke-RestMethod "$Api/instances/$instanceId" -Headers $Headers -ErrorAction Stop).data
     Write-Host "  status: $($inst.status)"
     if ($inst.status -eq "active" -and $inst.ip) { $ip = $inst.ip; break }
 }
@@ -93,7 +98,7 @@ Invoke-Ssh $ip "bash ml-agents/scripts/lambda/setup_instance.sh $RepoUrl $Branch
 
 # --- 7. Upload build + API key (for self-termination) ---
 Write-Host "Uploading build..."
-scp -i $KeyFile $BuildTgz "ubuntu@${ip}:~/build.tgz"
+scp -q -i $KeyFile $BuildTgz "ubuntu@${ip}:~/build.tgz"
 if ($LASTEXITCODE -ne 0) { throw "scp of build failed" }
 Invoke-Ssh $ip "tar -xzf ~/build.tgz -C ~/ml-agents/envs/ && rm ~/build.tgz"
 Invoke-Ssh $ip "umask 177 && echo '$ApiKey' > ~/.lambda_api_key"

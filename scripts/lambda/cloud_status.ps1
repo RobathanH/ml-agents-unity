@@ -10,11 +10,12 @@ param(
     [string]$KeyFile = "C:\Users\rob\ssh_keys\lambda.pem",
     [string]$ApiKeyFile = "C:\Users\rob\ssh_keys\lambda_api_key.txt"
 )
-$ErrorActionPreference = "Stop"
+# Continue, not Stop: ssh stderr under Stop kills PS 5.1 scripts (NativeCommandError)
+$ErrorActionPreference = "Continue"
 $Api = "https://cloud.lambdalabs.com/api/v1"
 $Headers = @{ Authorization = "Bearer $((Get-Content $ApiKeyFile -Raw).Trim())" }
 
-$instances = @((Invoke-RestMethod "$Api/instances" -Headers $Headers).data)
+$instances = @((Invoke-RestMethod "$Api/instances" -Headers $Headers -ErrorAction Stop).data)
 if ($instances.Count -eq 0) {
     Write-Host "No instances running. (Billing: `$0/hr)"
     return
@@ -26,7 +27,7 @@ foreach ($inst in $instances) {
     Write-Host "  $($inst.instance_type.name) in $($inst.region.name)  |  status: $($inst.status)  |  `$$price/hr  |  ip: $($inst.ip)"
     if ($inst.status -ne "active" -or -not $inst.ip) { continue }
 
-    $remote = ssh -i $KeyFile -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "ubuntu@$($inst.ip)" @'
+    $remote = ssh -i $KeyFile -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=10 "ubuntu@$($inst.ip)" @'
 echo "--- progress ---"
 grep -h "Step:" ~/ml-agents/results/*_console.log 2>/dev/null | tail -3
 echo "--- checkpoints ---"
