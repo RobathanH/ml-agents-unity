@@ -19,7 +19,9 @@ behaviors:
     hyperparameters:
       batch_size: 2048
       buffer_size: 20480
-      learning_rate: 0.001 #0.0003
+      # Run 008: 0.001 -> 0.0003. Run 007's value loss exploded (2.5 -> 20) and
+      # entropy rose late (1.42 -> 2.28) once rewards got bigger; stabilize.
+      learning_rate: 0.0003
       beta: 0.005
       epsilon: 0.2
       lambd: 0.95
@@ -72,7 +74,9 @@ environment_parameters:
   pushing_reward: 2.0
 
   # Terminal reward for winning (one opponent falls off)
-  win_reward: 8.0
+  # Run 008: back to 5 (8 inflated return variance -> value-loss blowup in 007);
+  # pushing/center shaping kept at 007 levels since draw rates improved.
+  win_reward: 5.0
 
   # Penalty for body touching ground (encourages proper locomotion)
   body_ground_penalty: 0.01
