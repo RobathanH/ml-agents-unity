@@ -34,11 +34,17 @@ behaviors:
     time_horizon: 1000
     summary_freq: 1000 #10000
     self_play:
-      save_steps: 50000
+      # Run 007 changes (tournament evaluation of run 006 showed head-to-head
+      # regression after ~5.5M steps that window-ELO missed): the old pool
+      # (window 50 x save_steps 50k) spanned only 2.5M steps, so anything the
+      # policy learned earlier was forgotten and strategies cycled. Wider
+      # snapshot spacing spans 12.5M steps; lower latest-model ratio plays
+      # more against the diverse pool.
+      save_steps: 250000
       team_change: 9999999999 # Team swaps cause reward/loss instability, and are unnecessary in a symmetric env, so this will disable them
       swap_steps: 5000
       window: 50
-      play_against_latest_model_ratio: 0.5
+      play_against_latest_model_ratio: 0.3
       initial_elo: 1200.0
 environment_parameters:
   learning_team: 0
@@ -55,14 +61,18 @@ environment_parameters:
   # Reward when one agent is in radius and other is out
   survival_reward: 0 #0.01
 
+  # Run 007: anti-stalemate shaping. Run 006 converged to a defensive draw-heavy
+  # meta (70-88% draws in evaluation; PushingReward stat ~0.0004 all run), so
+  # center pressure, pushing incentive, and the decisive-win payoff are raised.
+
   # Reward when one agent is closer to center than other (scaled by relative distance in radius units)
-  center_control_reward: 0.1
+  center_control_reward: 0.2
 
   # Reward for velocity of opponent away from center (opponent vel away - self vel away) (vel toward center is ignored)
-  pushing_reward: 1.0
+  pushing_reward: 2.0
 
   # Terminal reward for winning (one opponent falls off)
-  win_reward: 5.0
+  win_reward: 8.0
 
   # Penalty for body touching ground (encourages proper locomotion)
   body_ground_penalty: 0.01
