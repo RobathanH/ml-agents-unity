@@ -52,7 +52,7 @@ foreach ($inst in $instances) {
     $ip = $inst.ip
     # No parens/pipes in the remote command: Windows ssh + PowerShell mangle the
     # quoting. List everything, filter by extension client-side.
-    $listing = ssh -i $KeyFile -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=15 -o BatchMode=yes "ubuntu@$ip" "find /home/ubuntu/ml-agents/results -maxdepth 3 -type f -printf '%s %p\n' 2>/dev/null"
+    $listing = ssh -i $KeyFile -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes "ubuntu@$ip" "find /home/ubuntu/ml-agents/results -maxdepth 3 -type f -printf '%s %p\n' 2>/dev/null"
     if ($LASTEXITCODE -ne 0 -or -not $listing) { Log "WARN: could not list files on $ip"; continue }
 
     $wanted = "\.onnx$|\.pt$|\.yaml$|\.json$|\.log$|/events\.out\."
@@ -71,7 +71,7 @@ foreach ($inst in $instances) {
         }
         if ($need) {
             New-Item -ItemType Directory -Force (Split-Path $local) | Out-Null
-            scp -q -i $KeyFile -o LogLevel=ERROR -o BatchMode=yes "ubuntu@${ip}:$remote" $local 2>$null
+            scp -q -i $KeyFile -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes "ubuntu@${ip}:$remote" $local 2>$null
             if ($LASTEXITCODE -eq 0) { $pulled++ } else { Log "WARN: scp failed for $remote" }
         }
     }
