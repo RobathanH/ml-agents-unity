@@ -68,7 +68,11 @@ environment_parameters:
   # center pressure, pushing incentive, and the decisive-win payoff are raised.
 
   # Reward when one agent is closer to center than other (scaled by relative distance in radius units)
-  center_control_reward: 0.2
+  # Mid-008 adjustment: 0.2 -> 0.03. At 0.2, center-holding across a 1500-step
+  # episode out-earned the +5 win -> policies learned to draw while camping
+  # center (98% draws in evaluation at 15M steps). Shaping must stay well below
+  # the terminal reward.
+  center_control_reward: 0.03
 
   # Reward for velocity of opponent away from center (opponent vel away - self vel away) (vel toward center is ignored)
   pushing_reward: 2.0
