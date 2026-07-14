@@ -23,7 +23,8 @@ public class CrawlerSumoEnvController : MonoBehaviour
     [Tooltip("These values are overridden by environment_parameters in the config file")]
     private float minSpawnDistanceProportion = 0.1f; // Proportion of platform radius (0.2 = 20% of radius)
     private float maxSpawnDistanceProportion = 0.3f; // Proportion of platform radius (0.53 = 53% of radius)
-    private int maxEpisodeSteps = 3000;
+    // public so RolloutViewer's eval mode can match the training config's value
+    public int maxEpisodeSteps = 3000;
     private float survivalReward = 0.01f;
     private float centerControlReward = 0.005f;
     private float pushingReward = 0.01f;

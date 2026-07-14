@@ -39,6 +39,12 @@ public class RolloutViewer : MonoBehaviour
     int m_Done;
     bool m_Crawler1IsTeam0 = true;
     float m_StartTime;
+    // Fair sampling: every arena contributes the same number of episodes,
+    // otherwise "first N endings" over-samples fast decisive matches and
+    // under-samples timeout draws (which all arrive late, together).
+    int m_WavesPerArena = 1;
+    readonly System.Collections.Generic.Dictionary<CrawlerSumoEnvController, int> m_PerArena =
+        new System.Collections.Generic.Dictionary<CrawlerSumoEnvController, int>();
 
     [Serializable]
     class EvalResult
@@ -133,9 +139,22 @@ public class RolloutViewer : MonoBehaviour
                 var bp = anyCtrl[0].crawler1.GetComponent<BehaviorParameters>();
                 m_Crawler1IsTeam0 = bp == null || bp.TeamId == 0;
             }
+            // Match the training config's episode cap unless overridden
+            var maxSteps = GetArg("--max-episode-steps");
+            var cap = maxSteps != null ? int.Parse(maxSteps) : 1500;
+            foreach (var c in anyCtrl)
+            {
+                c.maxEpisodeSteps = cap;
+            }
+            // Round episode target up to a whole number of waves so every
+            // arena contributes equally
+            m_WavesPerArena = Mathf.Max(1, Mathf.CeilToInt(
+                m_EvalEpisodes / (float)Mathf.Max(1, anyCtrl.Length)));
+            m_EvalEpisodes = m_WavesPerArena * anyCtrl.Length;
             CrawlerSumoEnvController.MatchEnded += OnMatchEnded;
-            Debug.Log($"RolloutViewer: eval mode, target={m_EvalEpisodes} episodes, "
-                + $"timeScale={Time.timeScale}, arenas={anyCtrl.Length}");
+            Debug.Log($"RolloutViewer: eval mode, target={m_EvalEpisodes} episodes "
+                + $"({m_WavesPerArena}/arena), timeScale={Time.timeScale}, "
+                + $"arenas={anyCtrl.Length}, maxEpisodeSteps={cap}");
         }
     }
 
@@ -150,6 +169,13 @@ public class RolloutViewer : MonoBehaviour
         {
             return;
         }
+        // Per-arena quota: ignore extra episodes from fast arenas
+        m_PerArena.TryGetValue(ctrl, out var arenaCount);
+        if (arenaCount >= m_WavesPerArena)
+        {
+            return;
+        }
+        m_PerArena[ctrl] = arenaCount + 1;
         var c1Won = c1TerminalReward > 0f;
         var c2Won = c1TerminalReward < 0f;
         if (!c1Won && !c2Won)

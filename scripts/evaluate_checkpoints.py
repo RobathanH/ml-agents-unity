@@ -86,13 +86,14 @@ def ensure_sentis(run_id, onnx_paths):
     }
 
 
-def run_eval(team0_sentis, team1_sentis, episodes, time_scale, timeout):
+def run_eval(team0_sentis, team1_sentis, episodes, time_scale, timeout, max_steps):
     result_file = os.path.join(tempfile.gettempdir(), f"eval_{os.getpid()}_{time.time_ns()}.json")
     cmd = [
         EVAL_EXE,
         "--team0-model", team0_sentis, "--team1-model", team1_sentis,
         "--eval-episodes", str(episodes), "--result-json", result_file,
         "--time-scale", str(time_scale), "--eval-timeout", str(timeout),
+        "--max-episode-steps", str(max_steps),
         "-screen-width", "320", "-screen-height", "180", "-screen-fullscreen", "0",
     ]
     subprocess.run(cmd, timeout=timeout + 120)
@@ -102,11 +103,11 @@ def run_eval(team0_sentis, team1_sentis, episodes, time_scale, timeout):
     return result
 
 
-def play_matchup(sentis_a, sentis_b, episodes, time_scale, timeout):
+def play_matchup(sentis_a, sentis_b, episodes, time_scale, timeout, max_steps):
     """Side-swapped matchup. Returns (a_wins, b_wins, draws, timed_out)."""
     half = episodes // 2
-    r1 = run_eval(sentis_a, sentis_b, half, time_scale, timeout)
-    r2 = run_eval(sentis_b, sentis_a, episodes - half, time_scale, timeout)
+    r1 = run_eval(sentis_a, sentis_b, half, time_scale, timeout, max_steps)
+    r2 = run_eval(sentis_b, sentis_a, episodes - half, time_scale, timeout, max_steps)
     a = r1["team0_wins"] + r2["team1_wins"]
     b = r1["team1_wins"] + r2["team0_wins"]
     d = r1["draws"] + r2["draws"]
@@ -123,6 +124,9 @@ def main():
                     help="evaluate ~4 spread checkpoints against the earliest anchor")
     ap.add_argument("--time-scale", type=float, default=20.0)
     ap.add_argument("--timeout", type=float, default=600.0, help="per-side eval timeout (s)")
+    ap.add_argument("--max-episode-steps", type=int, default=3000,
+                    help="eval standard: 3000 (2x training cap) so matches resolve; "
+                         "evaluation play stalls longer than noisy training rollouts")
     args = ap.parse_args()
 
     run_id = args.run_id or newest_run()
@@ -135,8 +139,10 @@ def main():
         challengers = sorted({steps_sorted[max(0, round(i * (n - 1) / 4))] for i in range(1, 5)})
         matchups = [(c, anchor) for c in challengers if c != anchor]
     else:
-        a = args.model_a or steps_sorted[-1]
-        b = args.model_b or steps_sorted[0]
+        def nearest(step):
+            return min(steps_sorted, key=lambda s: abs(s - step))
+        a = nearest(args.model_a) if args.model_a else steps_sorted[-1]
+        b = nearest(args.model_b) if args.model_b else steps_sorted[0]
         matchups = [(a, b)]
 
     involved = sorted({s for m in matchups for s in m})
@@ -149,7 +155,8 @@ def main():
     for a_step, b_step in matchups:
         t0 = time.time()
         wa, wb, dr, to = play_matchup(
-            sentis[a_step], sentis[b_step], args.episodes, args.time_scale, args.timeout)
+            sentis[a_step], sentis[b_step], args.episodes, args.time_scale,
+            args.timeout, args.max_episode_steps)
         n = max(1, wa + wb + dr)
         flag = "  [TIMED OUT — partial]" if to else ""
         print(f"  {a_step/1e6:.1f}M vs {b_step/1e6:.1f}M:  "
