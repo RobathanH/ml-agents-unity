@@ -261,8 +261,16 @@ public class CrawlerSumoEnvController : MonoBehaviour
         return false;
     }
 
+    /// <summary>
+    /// Fired whenever a match ends, with crawler1's terminal reward
+    /// (positive = crawler1 won, negative = crawler2 won, 0 = draw).
+    /// Used by RolloutViewer's evaluation mode; no gameplay effect.
+    /// </summary>
+    public static event System.Action<CrawlerSumoEnvController, float> MatchEnded;
+
     private void EndBothEpisodesWithWinInfo(float c1TerminalReward, float c2TerminalReward)
     {
+        MatchEnded?.Invoke(this, c1TerminalReward);
         // Record win/loss statistics
         float c1WinReward = (c1TerminalReward > 0f) ? c1TerminalReward : 0f;
         float c2WinReward = (c2TerminalReward > 0f) ? c2TerminalReward : 0f;

@@ -29,6 +29,26 @@ public class RolloutViewer : MonoBehaviour
     float m_CaptureSeconds = 25f;
     float m_CaptureFps = 10f;
 
+    // Evaluation mode: count match outcomes across all arenas, write JSON, quit.
+    int m_EvalEpisodes;
+    string m_ResultJson;
+    float m_EvalTimeout = 600f;
+    int m_Team0Wins;
+    int m_Team1Wins;
+    int m_Draws;
+    int m_Done;
+    bool m_Crawler1IsTeam0 = true;
+    float m_StartTime;
+
+    [Serializable]
+    class EvalResult
+    {
+        public int team0_wins;
+        public int team1_wins;
+        public int draws;
+        public bool timed_out;
+    }
+
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
@@ -95,6 +115,86 @@ public class RolloutViewer : MonoBehaviour
             Directory.CreateDirectory(m_CaptureDir);
             StartCoroutine(CaptureLoop());
         }
+
+        var evalEpisodes = GetArg("--eval-episodes");
+        if (evalEpisodes != null)
+        {
+            m_EvalEpisodes = int.Parse(evalEpisodes);
+            m_ResultJson = GetArg("--result-json");
+            var ts = GetArg("--time-scale");
+            if (ts != null) { Time.timeScale = float.Parse(ts); }
+            var timeout = GetArg("--eval-timeout");
+            if (timeout != null) { m_EvalTimeout = float.Parse(timeout); }
+            m_StartTime = Time.unscaledTime;
+
+            var anyCtrl = FindObjectsByType<CrawlerSumoEnvController>(FindObjectsSortMode.None);
+            if (anyCtrl.Length > 0 && anyCtrl[0].crawler1 != null)
+            {
+                var bp = anyCtrl[0].crawler1.GetComponent<BehaviorParameters>();
+                m_Crawler1IsTeam0 = bp == null || bp.TeamId == 0;
+            }
+            CrawlerSumoEnvController.MatchEnded += OnMatchEnded;
+            Debug.Log($"RolloutViewer: eval mode, target={m_EvalEpisodes} episodes, "
+                + $"timeScale={Time.timeScale}, arenas={anyCtrl.Length}");
+        }
+    }
+
+    void OnDestroy()
+    {
+        CrawlerSumoEnvController.MatchEnded -= OnMatchEnded;
+    }
+
+    void OnMatchEnded(CrawlerSumoEnvController ctrl, float c1TerminalReward)
+    {
+        if (m_Done >= m_EvalEpisodes)
+        {
+            return;
+        }
+        var c1Won = c1TerminalReward > 0f;
+        var c2Won = c1TerminalReward < 0f;
+        if (!c1Won && !c2Won)
+        {
+            m_Draws++;
+        }
+        else if (c1Won == m_Crawler1IsTeam0)
+        {
+            m_Team0Wins++;
+        }
+        else
+        {
+            m_Team1Wins++;
+        }
+        m_Done++;
+        if (m_Done >= m_EvalEpisodes)
+        {
+            WriteResultsAndQuit(false);
+        }
+    }
+
+    void Update()
+    {
+        if (m_EvalEpisodes > 0 && Time.unscaledTime - m_StartTime > m_EvalTimeout)
+        {
+            WriteResultsAndQuit(true);
+        }
+    }
+
+    void WriteResultsAndQuit(bool timedOut)
+    {
+        m_EvalEpisodes = 0;  // prevent re-entry
+        var result = new EvalResult
+        {
+            team0_wins = m_Team0Wins,
+            team1_wins = m_Team1Wins,
+            draws = m_Draws,
+            timed_out = timedOut,
+        };
+        if (!string.IsNullOrEmpty(m_ResultJson))
+        {
+            File.WriteAllText(m_ResultJson, JsonUtility.ToJson(result));
+        }
+        Debug.Log($"RolloutViewer eval done: {JsonUtility.ToJson(result)}");
+        Application.Quit(timedOut ? 3 : 0);
     }
 
     /// <summary>
