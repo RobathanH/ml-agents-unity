@@ -25,6 +25,14 @@ public class CrawlerSumoEnvController : MonoBehaviour
     private float maxSpawnDistanceProportion = 0.3f; // Proportion of platform radius (0.53 = 53% of radius)
     // public so RolloutViewer's eval mode can match the training config's value
     public int maxEpisodeSteps = 3000;
+
+    // Shrinking ring: from ringShrinkStartStep the effective platform radius
+    // lerps toward platformRadius * ringShrinkEndProportion by episode end.
+    // An agent outside the effective radius counts as fallen even if standing.
+    // Forces decisive outcomes and breaks mutual-turtling equilibria (runs
+    // 006-008 all converged to draw-camping). 1.0 disables the shrink.
+    private int ringShrinkStartStep = 0;
+    private float ringShrinkEndProportion = 1f;
     private float survivalReward = 0.01f;
     private float centerControlReward = 0.005f;
     private float pushingReward = 0.01f;
@@ -80,6 +88,10 @@ public class CrawlerSumoEnvController : MonoBehaviour
         winReward = envParams.GetWithDefault("win_reward", winReward);
         bodyGroundPenalty = envParams.GetWithDefault("body_ground_penalty", bodyGroundPenalty);
         stabilityReward = envParams.GetWithDefault("stability_reward", stabilityReward);
+
+        // Shrinking ring
+        ringShrinkStartStep = Mathf.RoundToInt(envParams.GetWithDefault("ring_shrink_start_step", ringShrinkStartStep));
+        ringShrinkEndProportion = envParams.GetWithDefault("ring_shrink_end_proportion", ringShrinkEndProportion);
         
         Debug.Log($"CrawlerSumo: Loaded environment parameters - Platform Radius: {platformRadius} (scene), " +
                   $"Spawn Range: {minSpawnDistanceProportion * platformRadius:F1}-{maxSpawnDistanceProportion * platformRadius:F1}, " +
@@ -228,10 +240,27 @@ public class CrawlerSumoEnvController : MonoBehaviour
         m_C2LastPosition = c2Pos;
     }
 
+    private float EffectiveRadius()
+    {
+        if (ringShrinkEndProportion >= 1f || maxEpisodeSteps <= 0)
+        {
+            return platformRadius;
+        }
+        float t = Mathf.Clamp01(
+            (m_StepCount - ringShrinkStartStep)
+            / (float)Mathf.Max(1, maxEpisodeSteps - ringShrinkStartStep));
+        return platformRadius * Mathf.Lerp(1f, ringShrinkEndProportion, t);
+    }
+
     private bool CheckFallConditions()
     {
-        bool c1Fell = crawler1.body.position.y <= fallY;
-        bool c2Fell = crawler2.body.position.y <= fallY;
+        float effRadius = EffectiveRadius();
+        Vector3 p1 = crawler1.body.position;
+        Vector3 p2 = crawler2.body.position;
+        float d1 = Vector2.Distance(new Vector2(p1.x, p1.z), new Vector2(platformCenter.x, platformCenter.z));
+        float d2 = Vector2.Distance(new Vector2(p2.x, p2.z), new Vector2(platformCenter.x, platformCenter.z));
+        bool c1Fell = p1.y <= fallY || d1 > effRadius;
+        bool c2Fell = p2.y <= fallY || d2 > effRadius;
 
         if (c1Fell && !c2Fell)
         {

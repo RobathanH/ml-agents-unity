@@ -57,6 +57,13 @@ environment_parameters:
   
   # Episode Settings
   max_episode_steps: 1500
+
+  # Run 009: shrinking ring. Runs 006-008 all converged to mutual turtling
+  # (008: zero decisive games at 29M steps despite reward tweaks). From step
+  # 500 the effective radius lerps to 25% by episode end; agents outside it
+  # count as fallen. Guarantees decisive pressure -> gradient toward pushing.
+  ring_shrink_start_step: 500
+  ring_shrink_end_proportion: 0.25
   
   # ---------------------------- Reward Weights (Zero-Sum) ----------------------------
   
