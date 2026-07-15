@@ -98,10 +98,17 @@ Invoke-Ssh $ip "bash ml-agents/scripts/lambda/setup_instance.sh $RepoUrl $Branch
 
 # --- 7. Upload build + API key (for self-termination) ---
 Write-Host "Uploading build..."
-scp -q -i $KeyFile $BuildTgz "ubuntu@${ip}:~/build.tgz"
-if ($LASTEXITCODE -ne 0) { throw "scp of build failed" }
+$scpOk = $false
+for ($try = 1; $try -le 3; $try++) {
+    scp -q -i $KeyFile -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 $BuildTgz "ubuntu@${ip}:~/build.tgz"
+    if ($LASTEXITCODE -eq 0) { $scpOk = $true; break }
+    Write-Host "  scp attempt $try failed; retrying..."
+    Start-Sleep -Seconds 10
+}
+if (-not $scpOk) { throw "scp of build failed after 3 attempts (instance is RUNNING: $instanceId at $ip — finish manually or terminate)" }
 Invoke-Ssh $ip "tar -xzf ~/build.tgz -C ~/ml-agents/envs/ && rm ~/build.tgz"
-Invoke-Ssh $ip "umask 177 && echo '$ApiKey' > ~/.lambda_api_key"
+# umask scoped in a subshell: leaking it into the session poisons tmux socket perms
+Invoke-Ssh $ip "(umask 177 && echo '$ApiKey' > ~/.lambda_api_key)"
 
 # --- 8. Start training + watchdog ---
 $extra = if ($Resume) { "--resume" } else { "" }
