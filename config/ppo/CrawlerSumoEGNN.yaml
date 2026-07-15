@@ -62,8 +62,11 @@ environment_parameters:
   # (008: zero decisive games at 29M steps despite reward tweaks). From step
   # 500 the effective radius lerps to 25% by episode end; agents outside it
   # count as fallen. Guarantees decisive pressure -> gradient toward pushing.
-  ring_shrink_start_step: 500
-  ring_shrink_end_proportion: 0.25
+  ring_shrink_start_step: 300
+  # Run 010: 0.25 -> 0.10. At 0.25 the final circle (3.75u) fit both crawlers --
+  # they learned to co-huddle peacefully until timeout. 0.10 (1.5u) physically
+  # cannot hold two: someone must be pushed out.
+  ring_shrink_end_proportion: 0.10
   
   # ---------------------------- Reward Weights (Zero-Sum) ----------------------------
   
