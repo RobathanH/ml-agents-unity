@@ -105,7 +105,7 @@ for ($try = 1; $try -le 3; $try++) {
     Write-Host "  scp attempt $try failed; retrying..."
     Start-Sleep -Seconds 10
 }
-if (-not $scpOk) { throw "scp of build failed after 3 attempts (instance is RUNNING: $instanceId at $ip — finish manually or terminate)" }
+if (-not $scpOk) { throw "scp of build failed after 3 attempts (instance is RUNNING: $instanceId at $ip - finish manually or terminate)" }
 Invoke-Ssh $ip "tar -xzf ~/build.tgz -C ~/ml-agents/envs/ && rm ~/build.tgz"
 # umask scoped in a subshell: leaking it into the session poisons tmux socket perms
 Invoke-Ssh $ip "(umask 177 && echo '$ApiKey' > ~/.lambda_api_key)"
