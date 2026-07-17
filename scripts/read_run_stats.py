@@ -20,6 +20,7 @@ KEY_TAGS = [
     "CrawlerSumoLearner/PushingReward",
     "CrawlerSumoLearner/WinReward",
     "CrawlerSumoOpponent/WinReward",
+    "CrawlerSumo/FlipKnockdownEnd",  # run 011+: proportion of matches decided by flip
     "Losses/Value Loss",
 ]
 
