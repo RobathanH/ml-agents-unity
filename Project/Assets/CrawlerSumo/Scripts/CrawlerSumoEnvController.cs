@@ -33,6 +33,26 @@ public class CrawlerSumoEnvController : MonoBehaviour
     // 006-008 all converged to draw-camping). 1.0 disables the shrink.
     private int ringShrinkStartStep = 0;
     private float ringShrinkEndProportion = 1f;
+
+    // Actuator strength: per-episode multiplier sampled from [min, max], applied
+    // identically to BOTH crawlers (asymmetric strength would break zero-sum
+    // fairness and poison self-play ELO). 1.0/1.0 disables.
+    private float jointStrengthMultMin = 1f;
+    private float jointStrengthMultMax = 1f;
+
+    // Platform friction: per-episode static+dynamic friction sampled from
+    // [min, max] on an instanced physic material (default combine mode averages
+    // with the crawlers' default 0.6). min < 0 disables.
+    private float platformFrictionMin = -1f;
+    private float platformFrictionMax = -1f;
+
+    // Flip knockdown: a crawler whose body.up dot world-up stays below
+    // flipKnockdownDot for flipKnockdownSteps consecutive physics steps counts
+    // as fallen (loses). Makes flipping the opponent a direct win condition.
+    // 0 steps disables.
+    private int flipKnockdownSteps = 0;
+    private float flipKnockdownDot = -0.2f;
+
     private float survivalReward = 0.01f;
     private float centerControlReward = 0.005f;
     private float pushingReward = 0.01f;
@@ -45,6 +65,15 @@ public class CrawlerSumoEnvController : MonoBehaviour
     private float m_C2StartY;
     private Vector3 m_C1LastPosition;
     private Vector3 m_C2LastPosition;
+
+    private JointDriveController m_C1Jd;
+    private JointDriveController m_C2Jd;
+    private float m_BaseMaxJointSpring;
+    private float m_BaseMaxJointForceLimit;
+    private PhysicsMaterial m_PlatformMaterial;
+    private int m_C1FlipSteps;
+    private int m_C2FlipSteps;
+    private bool m_LastEndWasFlip;
 
     private StatsRecorder m_Recorder;
     private int m_CurrentLearningTeam = -1;
@@ -92,6 +121,18 @@ public class CrawlerSumoEnvController : MonoBehaviour
         // Shrinking ring
         ringShrinkStartStep = Mathf.RoundToInt(envParams.GetWithDefault("ring_shrink_start_step", ringShrinkStartStep));
         ringShrinkEndProportion = envParams.GetWithDefault("ring_shrink_end_proportion", ringShrinkEndProportion);
+
+        // Actuator strength randomization
+        jointStrengthMultMin = envParams.GetWithDefault("joint_strength_multiplier_min", jointStrengthMultMin);
+        jointStrengthMultMax = envParams.GetWithDefault("joint_strength_multiplier_max", jointStrengthMultMax);
+
+        // Platform friction randomization
+        platformFrictionMin = envParams.GetWithDefault("platform_friction_min", platformFrictionMin);
+        platformFrictionMax = envParams.GetWithDefault("platform_friction_max", platformFrictionMax);
+
+        // Flip knockdown
+        flipKnockdownSteps = Mathf.RoundToInt(envParams.GetWithDefault("flip_knockdown_steps", flipKnockdownSteps));
+        flipKnockdownDot = envParams.GetWithDefault("flip_knockdown_dot", flipKnockdownDot);
         
         Debug.Log($"CrawlerSumo: Loaded environment parameters - Platform Radius: {platformRadius} (scene), " +
                   $"Spawn Range: {minSpawnDistanceProportion * platformRadius:F1}-{maxSpawnDistanceProportion * platformRadius:F1}, " +
@@ -100,7 +141,48 @@ public class CrawlerSumoEnvController : MonoBehaviour
 
     private void Start()
     {
+        InitPhysicsRandomization();
         ResetSumo();
+    }
+
+    /// <summary>
+    /// Cache joint-drive baselines and locate this arena's platform collider.
+    /// Runs in Start (after all Awakes) so the physics scene is fully populated.
+    /// </summary>
+    private void InitPhysicsRandomization()
+    {
+        m_C1Jd = crawler1.GetComponent<JointDriveController>();
+        m_C2Jd = crawler2.GetComponent<JointDriveController>();
+        m_BaseMaxJointSpring = m_C1Jd.maxJointSpring;
+        m_BaseMaxJointForceLimit = m_C1Jd.maxJointForceLimit;
+
+        if (platformFrictionMin < 0f)
+        {
+            return;
+        }
+        // Find the platform collider by raycasting down at the arena center,
+        // ignoring anything that is part of a crawler. Avoids prefab rewiring
+        // and works for multi-arena clones (each arena hits its own platform).
+        var hits = Physics.RaycastAll(platformCenter + Vector3.up * 5f, Vector3.down, 30f);
+        Collider platform = null;
+        float best = float.MaxValue;
+        foreach (var hit in hits)
+        {
+            if (hit.collider.GetComponentInParent<CrawlerSumoAgent>() != null) continue;
+            if (hit.distance < best)
+            {
+                best = hit.distance;
+                platform = hit.collider;
+            }
+        }
+        if (platform == null)
+        {
+            Debug.LogWarning("CrawlerSumo: platform collider not found; friction randomization disabled");
+            platformFrictionMin = -1f;
+            return;
+        }
+        m_PlatformMaterial = new PhysicsMaterial("SumoPlatformRandomized");
+        platform.sharedMaterial = m_PlatformMaterial;
     }
 
     private void FixedUpdate()
@@ -259,8 +341,23 @@ public class CrawlerSumoEnvController : MonoBehaviour
         Vector3 p2 = crawler2.body.position;
         float d1 = Vector2.Distance(new Vector2(p1.x, p1.z), new Vector2(platformCenter.x, platformCenter.z));
         float d2 = Vector2.Distance(new Vector2(p2.x, p2.z), new Vector2(platformCenter.x, platformCenter.z));
-        bool c1Fell = p1.y <= fallY || d1 > effRadius;
-        bool c2Fell = p2.y <= fallY || d2 > effRadius;
+
+        bool c1Flipped = false;
+        bool c2Flipped = false;
+        if (flipKnockdownSteps > 0)
+        {
+            m_C1FlipSteps = Vector3.Dot(crawler1.body.up, Vector3.up) < flipKnockdownDot ? m_C1FlipSteps + 1 : 0;
+            m_C2FlipSteps = Vector3.Dot(crawler2.body.up, Vector3.up) < flipKnockdownDot ? m_C2FlipSteps + 1 : 0;
+            c1Flipped = m_C1FlipSteps >= flipKnockdownSteps;
+            c2Flipped = m_C2FlipSteps >= flipKnockdownSteps;
+        }
+
+        bool c1Fell = p1.y <= fallY || d1 > effRadius || c1Flipped;
+        bool c2Fell = p2.y <= fallY || d2 > effRadius || c2Flipped;
+        if (c1Fell || c2Fell)
+        {
+            m_LastEndWasFlip = c1Flipped || c2Flipped;
+        }
 
         if (c1Fell && !c2Fell)
         {
@@ -300,6 +397,12 @@ public class CrawlerSumoEnvController : MonoBehaviour
 
     private void EndBothEpisodesWithWinInfo(float c1TerminalReward, float c2TerminalReward)
     {
+        if (m_Recorder != null && flipKnockdownSteps > 0)
+        {
+            // Proportion of matches decided by flip knockdown (vs ring-out/timeout)
+            m_Recorder.Add("CrawlerSumo/FlipKnockdownEnd", m_LastEndWasFlip ? 1f : 0f);
+        }
+        m_LastEndWasFlip = false;
         MatchEnded?.Invoke(this, c1TerminalReward);
         // Record win/loss statistics
         float c1WinReward = (c1TerminalReward > 0f) ? c1TerminalReward : 0f;
@@ -324,6 +427,24 @@ public class CrawlerSumoEnvController : MonoBehaviour
     private void ResetSumo()
     {
         m_StepCount = 0;
+        m_C1FlipSteps = 0;
+        m_C2FlipSteps = 0;
+
+        // Per-episode physics randomization (same values for both crawlers)
+        if (m_C1Jd != null && (jointStrengthMultMin != 1f || jointStrengthMultMax != 1f))
+        {
+            float mult = Random.Range(jointStrengthMultMin, jointStrengthMultMax);
+            m_C1Jd.maxJointSpring = m_BaseMaxJointSpring * mult;
+            m_C1Jd.maxJointForceLimit = m_BaseMaxJointForceLimit * mult;
+            m_C2Jd.maxJointSpring = m_BaseMaxJointSpring * mult;
+            m_C2Jd.maxJointForceLimit = m_BaseMaxJointForceLimit * mult;
+        }
+        if (m_PlatformMaterial != null)
+        {
+            float friction = Random.Range(platformFrictionMin, platformFrictionMax);
+            m_PlatformMaterial.staticFriction = friction;
+            m_PlatformMaterial.dynamicFriction = friction;
+        }
 
         // Generate random spawn positions on the platform
         Vector2 spawn1, spawn2;

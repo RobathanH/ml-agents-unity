@@ -67,7 +67,32 @@ environment_parameters:
   # they learned to co-huddle peacefully until timeout. 0.10 (1.5u) physically
   # cannot hold two: someone must be pushed out.
   ring_shrink_end_proportion: 0.10
-  
+
+  # ------------------- Run 011: direct-impact physics upgrades -------------------
+  # Run 010 plateaued: tournament showed the 41M model roughly even with 15.5M
+  # and losing to 26M head-to-head, 66-70% draws under standard rules -- agents
+  # shuffle into each other and only win via the ring. Three changes to make
+  # direct impact (flipping, throws) the winning strategy:
+
+  # Flip knockdown: a crawler inverted (body.up dot up < flip_knockdown_dot)
+  # for this many consecutive physics steps loses outright. Flipping the
+  # opponent now earns the full +5 win.
+  flip_knockdown_steps: 60
+  flip_knockdown_dot: -0.2
+
+  # Actuator strength: per-episode multiplier U(min, max) applied to both
+  # crawlers' maxJointSpring/maxJointForceLimit. Stronger joints allow lifting
+  # and flipping the opponent instead of just leaning.
+  joint_strength_multiplier_min: 1.0
+  joint_strength_multiplier_max: 1.75
+
+  # Platform friction: per-episode static+dynamic friction U(min, max) on the
+  # platform (combines by averaging with the crawlers' default 0.6 -> effective
+  # 0.45-0.9; baseline was 0.6). Slippery episodes make pushes land; grippy
+  # episodes enable wedge-and-flip leverage.
+  platform_friction_min: 0.3
+  platform_friction_max: 1.2
+
   # ---------------------------- Reward Weights (Zero-Sum) ----------------------------
   
   # Reward when one agent is in radius and other is out
