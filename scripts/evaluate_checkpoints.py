@@ -86,7 +86,8 @@ def ensure_sentis(run_id, onnx_paths):
     }
 
 
-def run_eval(team0_sentis, team1_sentis, episodes, time_scale, timeout, max_steps):
+def run_eval(team0_sentis, team1_sentis, episodes, time_scale, timeout, max_steps,
+             env_params=()):
     result_file = os.path.join(tempfile.gettempdir(), f"eval_{os.getpid()}_{time.time_ns()}.json")
     cmd = [
         EVAL_EXE,
@@ -96,6 +97,10 @@ def run_eval(team0_sentis, team1_sentis, episodes, time_scale, timeout, max_step
         "--max-episode-steps", str(max_steps),
         "-screen-width", "320", "-screen-height", "180", "-screen-fullscreen", "0",
     ]
+    # Physics/env overrides so eval can match a run's training physics
+    # (standalone builds have no python side channel and default otherwise)
+    for p in env_params:
+        cmd += ["--env-param", p]
     subprocess.run(cmd, timeout=timeout + 120)
     with open(result_file) as f:
         result = json.load(f)
@@ -103,11 +108,12 @@ def run_eval(team0_sentis, team1_sentis, episodes, time_scale, timeout, max_step
     return result
 
 
-def play_matchup(sentis_a, sentis_b, episodes, time_scale, timeout, max_steps):
+def play_matchup(sentis_a, sentis_b, episodes, time_scale, timeout, max_steps,
+                 env_params=()):
     """Side-swapped matchup. Returns (a_wins, b_wins, draws, timed_out)."""
     half = episodes // 2
-    r1 = run_eval(sentis_a, sentis_b, half, time_scale, timeout, max_steps)
-    r2 = run_eval(sentis_b, sentis_a, episodes - half, time_scale, timeout, max_steps)
+    r1 = run_eval(sentis_a, sentis_b, half, time_scale, timeout, max_steps, env_params)
+    r2 = run_eval(sentis_b, sentis_a, episodes - half, time_scale, timeout, max_steps, env_params)
     a = r1["team0_wins"] + r2["team1_wins"]
     b = r1["team1_wins"] + r2["team0_wins"]
     d = r1["draws"] + r2["draws"]
@@ -127,6 +133,10 @@ def main():
     ap.add_argument("--max-episode-steps", type=int, default=3000,
                     help="eval standard: 3000 (2x training cap) so matches resolve; "
                          "evaluation play stalls longer than noisy training rollouts")
+    ap.add_argument("--env-param", action="append", default=[], metavar="NAME=VALUE",
+                    help="repeatable env-param override forwarded to the eval build "
+                         "(match the run's training physics, e.g. "
+                         "joint_strength_multiplier_min=1.5)")
     args = ap.parse_args()
 
     run_id = args.run_id or newest_run()
@@ -156,7 +166,7 @@ def main():
         t0 = time.time()
         wa, wb, dr, to = play_matchup(
             sentis[a_step], sentis[b_step], args.episodes, args.time_scale,
-            args.timeout, args.max_episode_steps)
+            args.timeout, args.max_episode_steps, args.env_param)
         n = max(1, wa + wb + dr)
         flag = "  [TIMED OUT — partial]" if to else ""
         print(f"  {a_step/1e6:.1f}M vs {b_step/1e6:.1f}M:  "

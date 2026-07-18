@@ -99,40 +99,77 @@ public class CrawlerSumoEnvController : MonoBehaviour
         InitializeLearningTeamDetection();
     }
 
+    // CLI overrides for standalone eval/viewer builds, which have no python
+    // side channel and would otherwise run DEFAULT physics — a policy trained
+    // under modified constants (e.g. run 011's 1.5x strength) is meaningless
+    // to evaluate under different physics. Repeatable arg: --env-param name=value.
+    // Lazily parsed: no script-execution-order dependency. Training never
+    // passes the flag, so trainer-driven runs are unaffected.
+    private static System.Collections.Generic.Dictionary<string, float> s_CliOverrides;
+
+    private static System.Collections.Generic.Dictionary<string, float> CliOverrides
+    {
+        get
+        {
+            if (s_CliOverrides == null)
+            {
+                s_CliOverrides = new System.Collections.Generic.Dictionary<string, float>();
+                var args = System.Environment.GetCommandLineArgs();
+                for (int i = 0; i < args.Length - 1; i++)
+                {
+                    if (args[i] != "--env-param") continue;
+                    var kv = args[i + 1].Split('=');
+                    if (kv.Length == 2 && float.TryParse(
+                            kv[1], System.Globalization.NumberStyles.Float,
+                            System.Globalization.CultureInfo.InvariantCulture, out var f))
+                    {
+                        s_CliOverrides[kv[0]] = f;
+                        Debug.Log($"CrawlerSumo: CLI env-param override {kv[0]}={f}");
+                    }
+                }
+            }
+            return s_CliOverrides;
+        }
+    }
+
+    private float GetParam(string name, float def)
+    {
+        if (CliOverrides.TryGetValue(name, out var v)) return v;
+        return Academy.Instance.EnvironmentParameters.GetWithDefault(name, def);
+    }
+
     private void LoadEnvironmentParameters()
     {
-        var envParams = Academy.Instance.EnvironmentParameters;
-        
         // Spawn settings (proportional to platform radius)
-        minSpawnDistanceProportion = envParams.GetWithDefault("min_spawn_distance_proportion", minSpawnDistanceProportion);
-        maxSpawnDistanceProportion = envParams.GetWithDefault("max_spawn_distance_proportion", maxSpawnDistanceProportion);
-        
+        minSpawnDistanceProportion = GetParam("min_spawn_distance_proportion", minSpawnDistanceProportion);
+        maxSpawnDistanceProportion = GetParam("max_spawn_distance_proportion", maxSpawnDistanceProportion);
+
         // Episode settings
-        maxEpisodeSteps = Mathf.RoundToInt(envParams.GetWithDefault("max_episode_steps", maxEpisodeSteps));
-        
+        maxEpisodeSteps = Mathf.RoundToInt(GetParam("max_episode_steps", maxEpisodeSteps));
+
         // Reward weights
-        survivalReward = envParams.GetWithDefault("survival_reward", survivalReward);
-        centerControlReward = envParams.GetWithDefault("center_control_reward", centerControlReward);
-        pushingReward = envParams.GetWithDefault("pushing_reward", pushingReward);
-        winReward = envParams.GetWithDefault("win_reward", winReward);
-        bodyGroundPenalty = envParams.GetWithDefault("body_ground_penalty", bodyGroundPenalty);
-        stabilityReward = envParams.GetWithDefault("stability_reward", stabilityReward);
+        survivalReward = GetParam("survival_reward", survivalReward);
+        centerControlReward = GetParam("center_control_reward", centerControlReward);
+        pushingReward = GetParam("pushing_reward", pushingReward);
+        winReward = GetParam("win_reward", winReward);
+        bodyGroundPenalty = GetParam("body_ground_penalty", bodyGroundPenalty);
+        stabilityReward = GetParam("stability_reward", stabilityReward);
 
         // Shrinking ring
-        ringShrinkStartStep = Mathf.RoundToInt(envParams.GetWithDefault("ring_shrink_start_step", ringShrinkStartStep));
-        ringShrinkEndProportion = envParams.GetWithDefault("ring_shrink_end_proportion", ringShrinkEndProportion);
+        ringShrinkStartStep = Mathf.RoundToInt(GetParam("ring_shrink_start_step", ringShrinkStartStep));
+        ringShrinkEndProportion = GetParam("ring_shrink_end_proportion", ringShrinkEndProportion);
 
         // Actuator strength randomization
-        jointStrengthMultMin = envParams.GetWithDefault("joint_strength_multiplier_min", jointStrengthMultMin);
-        jointStrengthMultMax = envParams.GetWithDefault("joint_strength_multiplier_max", jointStrengthMultMax);
+        jointStrengthMultMin = GetParam("joint_strength_multiplier_min", jointStrengthMultMin);
+        jointStrengthMultMax = GetParam("joint_strength_multiplier_max", jointStrengthMultMax);
 
         // Platform friction randomization
-        platformFrictionMin = envParams.GetWithDefault("platform_friction_min", platformFrictionMin);
-        platformFrictionMax = envParams.GetWithDefault("platform_friction_max", platformFrictionMax);
+        platformFrictionMin = GetParam("platform_friction_min", platformFrictionMin);
+        platformFrictionMax = GetParam("platform_friction_max", platformFrictionMax);
 
         // Flip knockdown
-        flipKnockdownSteps = Mathf.RoundToInt(envParams.GetWithDefault("flip_knockdown_steps", flipKnockdownSteps));
-        flipKnockdownDot = envParams.GetWithDefault("flip_knockdown_dot", flipKnockdownDot);
+        flipKnockdownSteps = Mathf.RoundToInt(GetParam("flip_knockdown_steps", flipKnockdownSteps));
+        flipKnockdownDot = GetParam("flip_knockdown_dot", flipKnockdownDot);
         
         Debug.Log($"CrawlerSumo: Loaded environment parameters - Platform Radius: {platformRadius} (scene), " +
                   $"Spawn Range: {minSpawnDistanceProportion * platformRadius:F1}-{maxSpawnDistanceProportion * platformRadius:F1}, " +

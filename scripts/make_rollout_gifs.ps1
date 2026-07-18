@@ -19,7 +19,10 @@ param(
     [int]$CaptureFps = 10,
     [string]$UnityExe = "C:\Program Files\Unity\Hub\Editor\6000.0.40f1\Editor\Unity.exe",
     [string]$ViewerExe = "D:\UnityRL\ml-agents\envs\CrawlerSumoEGNN_viewer_win\CrawlerSumoViewer.exe",
-    [string]$ProjectPath = "D:\UnityRL\ml-agents\Project"
+    [string]$ProjectPath = "D:\UnityRL\ml-agents\Project",
+    # name=value overrides forwarded to the viewer as --env-param (match the
+    # run's training physics, e.g. "joint_strength_multiplier_min=1.5")
+    [string[]]$EnvParams = @()
 )
 $ErrorActionPreference = "Continue"
 $LogFile = Join-Path $StagingRoot "gif.log"
@@ -88,11 +91,13 @@ foreach ($label in $opponents.Keys) {
     Remove-Item $frames -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $frames | Out-Null
 
-    $p = Start-Process -FilePath $ViewerExe -PassThru -ArgumentList @(
+    $viewerArgs = @(
         "--team0-model", $currentSentis, "--team1-model", $oppSentis,
         "--capture-dir", $frames, "--capture-seconds", $CaptureSeconds, "--capture-fps", $CaptureFps,
         "-screen-width", "640", "-screen-height", "360", "-screen-fullscreen", "0", "-popupwindow"
     )
+    foreach ($ep in $EnvParams) { $viewerArgs += @("--env-param", $ep) }
+    $p = Start-Process -FilePath $ViewerExe -PassThru -ArgumentList $viewerArgs
     if (-not $p.WaitForExit(($CaptureSeconds + 45) * 1000)) {
         $p.Kill()
         Log "WARN: viewer timed out for $label"
