@@ -179,7 +179,37 @@ public class CrawlerSumoEnvController : MonoBehaviour
     private void Start()
     {
         InitPhysicsRandomization();
+        ApplyTeamColors();
         ResetSumo();
+    }
+
+    // Team tints so rollouts are unambiguous about which agent is which:
+    // team 0 = blue, team 1 = orange. In viewer/eval builds --team0-model is
+    // always the "current" checkpoint, so blue = current, orange = opponent.
+    // MaterialPropertyBlock only: no material instances, no effect on physics,
+    // and -nographics training runs never draw it.
+    private static readonly Color k_Team0Color = new Color(0.25f, 0.55f, 1f);
+    private static readonly Color k_Team1Color = new Color(1f, 0.5f, 0.1f);
+
+    private void ApplyTeamColors()
+    {
+        TintCrawler(crawler1);
+        TintCrawler(crawler2);
+    }
+
+    private void TintCrawler(CrawlerSumoAgent crawler)
+    {
+        var bp = crawler.GetComponent<BehaviorParameters>();
+        var teamId = bp != null ? bp.TeamId : 0;
+        var mpb = new MaterialPropertyBlock();
+        mpb.SetColor("_Color", teamId == 0 ? k_Team0Color : k_Team1Color);
+        foreach (var r in crawler.GetComponentsInChildren<Renderer>(true))
+        {
+            var m = r.sharedMaterial;
+            // Black joint segments keep their material for pose contrast
+            if (m != null && m.name.StartsWith("Black")) continue;
+            r.SetPropertyBlock(mpb);
+        }
     }
 
     /// <summary>
