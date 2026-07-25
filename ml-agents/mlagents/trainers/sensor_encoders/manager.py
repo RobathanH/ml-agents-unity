@@ -66,6 +66,11 @@ def build_egnn_registry(
             k_neighbors=int(pick("k_neighbors")),
             pos_dim=int(pick("pos_dim")),
             max_entities=int(shape[0]),
+            attr_mode=str(pick("attr_mode")),
+            has_quaternion=bool(pick("has_quaternion")),
+            has_linear_velocity=bool(pick("has_linear_velocity")),
+            has_angular_velocity=bool(pick("has_angular_velocity")),
+            up_axis=tuple(pick("up_axis")),
         )
         registry[name] = {
             "module": egnn,
@@ -82,6 +87,16 @@ def build_egnn_registry(
             f"hidden_dim={int(pick('hidden_dim'))}, message_dim={int(pick('message_dim'))}, "
             f"embedding_size={embedding_size}"
         )
+        # The declared layout cannot be read back from the BufferSensor, so log it
+        # and flag the shapes that indicate a mismatch with the Unity toggles.
+        logger.info(f"[EGNN] Sensor '{name}' entity layout: {egnn.layout_description()}")
+        if egnn.attr_mode == "equivariant" and egnn.scalar_dim < 2:
+            logger.warning(
+                f"[EGNN] Sensor '{name}' has only {egnn.scalar_dim} invariant column(s) left "
+                "after the declared geometry blocks. The sensor always emits a type and a "
+                "subtype one-hot, so expect at least 2 -- has_quaternion/has_linear_velocity/"
+                "has_angular_velocity probably over-declare what Unity is writing."
+            )
     if not registry:
         logger.warning(
             f"[EGNN] egnn_encoders enabled for behavior '{behavior_name}' but no matching "

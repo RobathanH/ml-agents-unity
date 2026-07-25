@@ -220,6 +220,21 @@ class EGNNSensorEncoderDefaults:
     k_neighbors: int = 8
     pos_dim: int = 3
     embedding_size: int = 128
+    # Entity-row layout. These MUST mirror the Unity EGNNSensorComponent's
+    # m_IncludeRotation / m_IncludeLinearVelocity / m_IncludeAngularVelocity
+    # toggles, because BuildRow writes the optional blocks in this fixed order:
+    #   pos(3) | quat(4)? | linear vel(3)? | angular vel(3)? | one-hots(rest)
+    # A mismatch silently reinterprets geometry as one-hots, so the encoder
+    # validates the declared layout against the sensor width and logs it.
+    attr_mode: str = "equivariant"  # "equivariant" | "raw" (pre-fix behaviour)
+    has_quaternion: bool = True
+    has_linear_velocity: bool = True
+    has_angular_velocity: bool = True
+    # Vertical axis expressed in the sensor's virtual-root frame. Supplied to the
+    # encoder as a constant equivariant channel so gravity-dependent quantities
+    # (uprightness, height difference, vertical speed) remain representable
+    # without giving up yaw/translation equivariance.
+    up_axis: List[float] = attr.ib(factory=lambda: [0.0, 1.0, 0.0])
 
 
 @attr.s(auto_attribs=True)
@@ -231,6 +246,11 @@ class EGNNSensorEncoderOverride:
     k_neighbors: Optional[int] = None
     pos_dim: Optional[int] = None
     embedding_size: Optional[int] = None
+    attr_mode: Optional[str] = None
+    has_quaternion: Optional[bool] = None
+    has_linear_velocity: Optional[bool] = None
+    has_angular_velocity: Optional[bool] = None
+    up_axis: Optional[List[float]] = None
 
 
 @attr.s(auto_attribs=True)
