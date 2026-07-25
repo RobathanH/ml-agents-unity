@@ -96,7 +96,7 @@ Each bound is stated as the value at difficulty `d = 0` (curriculum start) and
 | Wall height (must mount) | — | 2.2 | Needs rear-up (1.8) **plus** a hop; above this it is not reliably solvable |
 | Gap width | 0.4 | 2.5 | 2.5 ≈ 0.7× splayed span: a static straddle fails, needs a run-up |
 | Overhang clearance | 2.4 | 1.15 | Body is 1.0 across — 1.15 is a 0.15 margin, forces a full belly-crawl |
-| Lateral corridor | 6 m | 1.35 m | 1.35 forces legs tucked from 3.5 to ≈1.4: a genuinely distinct gait |
+| Lateral corridor | 6 m | 1.7 m | Forces legs tucked from 3.5 to ≈1.4: a genuinely distinct gait. Was 1.35 in the first draft, which is *narrower than the tucked stance itself* — impossible rather than hard |
 | Ramp pitch | 5° | 40° | ≈ arctan(µ) for the physics material; steeper simply slides |
 | Off-camber roll | 0° | 25° | Beyond this the body slides off sideways regardless of gait |
 | Pebble field density | 0 | 2.5 /m² | Dense enough that a fixed-period gait trips |
@@ -108,8 +108,14 @@ Two bounds deserve emphasis because they are the ones that force the
 - **Overhang at 1.15 m** cannot be cleared by the nominal 1.0 m stance plus leg
   swing — the body must go down and stay down while the legs still generate
   thrust. That is not a scaled-down walk; it is a different gait.
-- **Lateral corridor at 1.35 m** cannot be entered with legs splayed at 3.5 m.
+- **Lateral corridor at 1.7 m** cannot be entered with legs splayed at 3.5 m.
   The agent must tuck, align its yaw, and push through. Also not a scaled walk.
+
+Both bounds have a second, easily-missed requirement: the obstacle must not be
+*avoidable by a different move*. An overhang thin enough to climb on top of is
+not a crawl obstacle, it is a vault — so the slab is thick enough that its top
+stays above the mountable height at every difficulty. The feasibility harness
+checks this explicitly, because it was wrong in the first implementation.
 
 These are exactly the cases where "navigating around would require a constrained
 gait" — and because the track has fall-off edges (§3.1), going around is not an
