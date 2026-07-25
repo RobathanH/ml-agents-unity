@@ -110,12 +110,14 @@ namespace CrawlerParkour
             agent.actionRateCostWeight = actionRateCostWeight;
             agent.MaxStepOverride = maxEpisodeSteps;
 
+            // Track space: the generator lays everything out relative to its own
+            // root, so a replicated arena is a pure translation of this one.
             float laneX = track.LaneCenterAt(1f);
             float y = track.GroundHeightAt(laneX, 1f, out float g) ? g + 1.2f : 1.2f;
             // The agent applies this inside OnEpisodeBegin, after BodyPart.Reset
             // has restored its recorded world transforms -- placing it from here
             // would just be undone.
-            agent.SpawnPoint = new Vector3(laneX, y, 1f);
+            agent.SpawnPoint = track.ToWorld(new Vector3(laneX, y, 1f));
 
             m_Steps = 0;
             m_EpisodeIndex++;

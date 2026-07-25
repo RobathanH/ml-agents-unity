@@ -9,10 +9,15 @@ namespace CrawlerParkour
     /// type instead of minting a one-hot per semantic role.
     /// </summary>
     /// <remarks>
-    /// World-space axes and half-extents are cached at placement time. Obstacles
-    /// are static for the whole episode, so recomputing them from the transform on
-    /// every sensor query would be pure waste -- and the sensor queries this at
-    /// frame rate for every agent.
+    /// Axes and half-extents are cached at placement time. Obstacles are static for
+    /// the whole episode, so recomputing them from the transform on every sensor
+    /// query would be pure waste -- and the sensor queries this at frame rate for
+    /// every agent.
+    ///
+    /// All coordinates here are in the owning <see cref="ParkourTrackGenerator"/>'s
+    /// frame, not world space, so that arenas can be replicated by translating the
+    /// track root. Anything that meets the outside world -- the EGNN entity source,
+    /// the agent -- converts at its own boundary.
     /// </remarks>
     public class ParkourBox
     {
@@ -29,10 +34,10 @@ namespace CrawlerParkour
         /// pass can tell a floor tile from something standing on it.</summary>
         public bool IsFloor;
 
-        /// <summary>World AABB, for broad-phase rejection only. Never use it for
-        /// surface queries -- see the remarks on <see cref="VerticalSpanAt"/>.
+        /// <summary>Track-frame AABB, for broad-phase rejection only. Never use it
+        /// for surface queries -- see the remarks on <see cref="VerticalSpanAt"/>.
         /// </summary>
-        public Vector3 WorldMin, WorldMax;
+        public Vector3 BoundsMin, BoundsMax;
 
         private Vector3 m_Right, m_Up, m_Fwd;
 
@@ -48,11 +53,14 @@ namespace CrawlerParkour
                 Mathf.Abs(m_Right.x) * halfExtents.x + Mathf.Abs(m_Up.x) * halfExtents.y + Mathf.Abs(m_Fwd.x) * halfExtents.z,
                 Mathf.Abs(m_Right.y) * halfExtents.x + Mathf.Abs(m_Up.y) * halfExtents.y + Mathf.Abs(m_Fwd.y) * halfExtents.z,
                 Mathf.Abs(m_Right.z) * halfExtents.x + Mathf.Abs(m_Up.z) * halfExtents.y + Mathf.Abs(m_Fwd.z) * halfExtents.z);
-            WorldMin = center - e;
-            WorldMax = center + e;
+            BoundsMin = center - e;
+            BoundsMax = center + e;
             if (Tr != null)
             {
-                Tr.SetPositionAndRotation(center, rotation);
+                // Local, not world: center is in the track's frame. The generator
+                // guarantees the box parent chain is a pure translation of that
+                // frame, so this lands where the maths says it does.
+                Tr.SetLocalPositionAndRotation(center, rotation);
                 Tr.localScale = halfExtents * 2f;
             }
         }

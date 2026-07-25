@@ -160,11 +160,52 @@ namespace CrawlerParkour
         /// </summary>
         public int RepairCount { get; private set; }
 
+        /// <summary>
+        /// Origin of the track frame in world space. Every coordinate this class
+        /// produces or accepts -- box centres, <see cref="GroundHeightAt"/>,
+        /// <see cref="LaneCenterAt"/> -- is relative to it, so replicated arenas are
+        /// just translations of one another and the generator never has to know
+        /// where it was placed.
+        /// </summary>
+        /// <remarks>
+        /// Null-tolerant because the offline feasibility harness constructs the
+        /// generator directly, with no GameObject behind it; there the origin is
+        /// zero and track space is world space.
+        /// </remarks>
+        public Vector3 Origin => transform != null ? transform.position : Vector3.zero;
+
+        public Vector3 ToWorld(Vector3 trackPoint) => trackPoint + Origin;
+        public Vector3 ToTrack(Vector3 worldPoint) => worldPoint - Origin;
+
         public void Generate(int seed, float difficulty)
         {
             m_Rng = new System.Random(seed);
             m_Diff = ParkourDifficulty.From(difficulty);
             RepairCount = 0;
+
+            // Boxes are positioned with localPosition under BoxParent, so track
+            // space maps to world space by translation alone only while nothing
+            // between here and a box carries rotation or scale, and BoxParent sits
+            // exactly on the track root. Violating that produces a track that
+            // generates cleanly, passes its own feasibility check, and is then laid
+            // out somewhere other than where the check verified -- so it is worth a
+            // loud error rather than a silent drift.
+            if (transform != null)
+            {
+                var parent = BoxParent != null ? BoxParent : transform;
+                if (transform.rotation != Quaternion.identity
+                    || transform.lossyScale != Vector3.one
+                    || parent.position != transform.position
+                    || parent.rotation != Quaternion.identity
+                    || parent.lossyScale != Vector3.one)
+                {
+                    Debug.LogError(
+                        $"{name}: the track root and its BoxParent must be pure translations "
+                        + "of world space, coincident with each other -- obstacle placement "
+                        + "assumes it. Track scale/rotation or a displaced BoxParent will put "
+                        + "the geometry somewhere the feasibility check never looked.");
+                }
+            }
 
             foreach (var b in m_Active)
             {
@@ -533,7 +574,7 @@ namespace CrawlerParkour
                 for (int i = 0; i < m_Active.Count; i++)
                 {
                     var box = m_Active[i];
-                    if (z < box.WorldMin.z || z > box.WorldMax.z) continue;
+                    if (z < box.BoundsMin.z || z > box.BoundsMax.z) continue;
                     m_SliceCandidates.Add(box);
                 }
 
@@ -547,7 +588,7 @@ namespace CrawlerParkour
                     {
                         var box = m_SliceCandidates[i];
                         if (!box.IsFloor) continue;
-                        if (x < box.WorldMin.x || x > box.WorldMax.x) continue;
+                        if (x < box.BoundsMin.x || x > box.BoundsMax.x) continue;
                         if (!box.VerticalSpanAt(x, z, out _, out float to)) continue;
                         if (to > floorTop) floorTop = to;
                     }
@@ -567,7 +608,7 @@ namespace CrawlerParkour
                     {
                         var box = m_SliceCandidates[i];
                         if (box.IsFloor) continue;
-                        if (x < box.WorldMin.x || x > box.WorldMax.x) continue;
+                        if (x < box.BoundsMin.x || x > box.BoundsMax.x) continue;
                         if (!box.VerticalSpanAt(x, z, out float bo, out float to)) continue;
                         if (to <= floorTop + 1e-3f) continue;      // buried in the floor
 
@@ -600,8 +641,8 @@ namespace CrawlerParkour
             return true;
         }
 
-        /// <summary>Highest walkable surface at a world column, for spawning and
-        /// respawning. Returns false where there is no ground.</summary>
+        /// <summary>Highest walkable surface at a track-space column, for spawning
+        /// and respawning. Returns false where there is no ground.</summary>
         public bool GroundHeightAt(float x, float z, out float top)
         {
             top = float.NegativeInfinity;
@@ -615,8 +656,9 @@ namespace CrawlerParkour
             return !float.IsNegativeInfinity(top);
         }
 
-        /// <summary>Lane centre for the segment containing <paramref name="z"/>.
-        /// Respawns use it so the agent restarts on the traversable route.</summary>
+        /// <summary>Lane centre for the segment containing track-space
+        /// <paramref name="z"/>. Respawns use it so the agent restarts on the
+        /// traversable route.</summary>
         public float LaneCenterAt(float z)
         {
             if (m_LaneCenter.Count == 0) return 0f;

@@ -41,6 +41,22 @@ namespace CrawlerParkour
         [System.NonSerialized] public float respawnPenalty;
         [System.NonSerialized] public float finishBonus = 5f;
 
+        /// <summary>
+        /// Everything CollectObservations writes outside the height field:
+        /// 6 orientation (up, forward in the yaw frame) + 6 velocity + 1 height
+        /// above ground + 4 foot contacts + 5 track-relative + 20 previous actions.
+        /// </summary>
+        /// <remarks>
+        /// Here rather than in the scene builder because it has to track the body
+        /// of CollectObservations, and the failure it guards against is quiet:
+        /// BehaviorParameters declaring more floats than the agent writes pads the
+        /// tail with zeros and trains anyway.
+        /// </remarks>
+        public const int NonGridObservations = 6 + 6 + 1 + 4 + 5 + 20;
+
+        /// <summary>Total vector observation size, for BehaviorParameters.</summary>
+        public int ObservationCount => NonGridObservations + 2 * GridForward * GridLateral;
+
         public float MaxProgress { get; private set; }
         public int RespawnCount { get; private set; }
         public bool Finished { get; private set; }
@@ -104,6 +120,14 @@ namespace CrawlerParkour
             return Quaternion.LookRotation(fwd.normalized, Vector3.up);
         }
 
+        /// <summary>
+        /// Body position in the track's frame. The generator places geometry
+        /// relative to its own root so that arenas are translations of one another,
+        /// so every comparison against track coordinates has to go through here.
+        /// Rigidbody positions, raycasts and the EGNN sensor all stay in world space.
+        /// </summary>
+        private Vector3 TrackPos => track != null ? track.ToTrack(body.position) : body.position;
+
         public override void CollectObservations(VectorSensor sensor)
         {
             var inv = Quaternion.Inverse(YawFrame());
@@ -114,9 +138,10 @@ namespace CrawlerParkour
             sensor.AddObservation(inv * rb.linearVelocity * 0.1f);
             sensor.AddObservation(inv * rb.angularVelocity * 0.1f);
 
+            var tp = TrackPos;
             float groundY = 0f;
-            bool haveGround = track != null && track.GroundHeightAt(body.position.x, body.position.z, out groundY);
-            sensor.AddObservation(haveGround ? Mathf.Clamp((body.position.y - groundY) / 3f, -2f, 2f) : -2f);
+            bool haveGround = track != null && track.GroundHeightAt(tp.x, tp.z, out groundY);
+            sensor.AddObservation(haveGround ? Mathf.Clamp((tp.y - groundY) / 3f, -2f, 2f) : -2f);
 
             foreach (var foot in m_Feet)
             {
@@ -127,11 +152,11 @@ namespace CrawlerParkour
             // Track-relative situation.
             float len = track != null ? track.TrackLength : 1f;
             float halfW = track != null ? track.TrackWidth * 0.5f : 1f;
-            float laneX = track != null ? track.LaneCenterAt(body.position.z) : 0f;
-            sensor.AddObservation(Mathf.Clamp((body.position.x - laneX) / 5f, -2f, 2f));
-            sensor.AddObservation(Mathf.Clamp((halfW - body.position.x) / 5f, -2f, 2f));
-            sensor.AddObservation(Mathf.Clamp((body.position.x + halfW) / 5f, -2f, 2f));
-            sensor.AddObservation(Mathf.Clamp01(body.position.z / len));
+            float laneX = track != null ? track.LaneCenterAt(tp.z) : 0f;
+            sensor.AddObservation(Mathf.Clamp((tp.x - laneX) / 5f, -2f, 2f));
+            sensor.AddObservation(Mathf.Clamp((halfW - tp.x) / 5f, -2f, 2f));
+            sensor.AddObservation(Mathf.Clamp((tp.x + halfW) / 5f, -2f, 2f));
+            sensor.AddObservation(Mathf.Clamp01(tp.z / len));
             sensor.AddObservation(Mathf.Clamp01(MaxProgress / len));
 
             AddHeightField(sensor);
@@ -227,7 +252,7 @@ namespace CrawlerParkour
         private void ApplyProgressReward()
         {
             if (Finished || track == null) return;
-            float z = body.position.z;
+            float z = TrackPos.z;
             if (z > MaxProgress)
             {
                 AddReward(progressWeight * (z - MaxProgress) / track.TrackLength);
@@ -294,12 +319,13 @@ namespace CrawlerParkour
         public bool HasFallen(float fallDepth)
         {
             if (track == null) return false;
-            if (!track.GroundHeightAt(body.position.x, body.position.z, out float g))
+            var tp = TrackPos;
+            if (!track.GroundHeightAt(tp.x, tp.z, out float g))
             {
                 // No ground under it at all: over the void.
-                return body.position.y < -fallDepth;
+                return tp.y < -fallDepth;
             }
-            return body.position.y < g - fallDepth;
+            return tp.y < g - fallDepth;
         }
 
         /// <summary>
@@ -317,14 +343,15 @@ namespace CrawlerParkour
         }
 
         /// <summary>Spawn point for the last cleared checkpoint, on the lane so the
-        /// agent restarts on the traversable route rather than beside it.</summary>
+        /// agent restarts on the traversable route rather than beside it. Returned
+        /// in world space, ready for <see cref="TeleportTo"/>.</summary>
         public Vector3 CheckpointSpawn()
         {
-            float x = track != null ? track.LaneCenterAt(m_CheckpointZ) : 0f;
+            if (track == null) return new Vector3(0f, 1.2f, m_CheckpointZ + 0.5f);
+            float x = track.LaneCenterAt(m_CheckpointZ);
             float z = m_CheckpointZ + 0.5f;
-            float y = 1.2f;
-            if (track != null && track.GroundHeightAt(x, z, out float g)) y = g + 1.2f;
-            return new Vector3(x, y, z);
+            float y = track.GroundHeightAt(x, z, out float g) ? g + 1.2f : 1.2f;
+            return track.ToWorld(new Vector3(x, y, z));
         }
 
         /// <summary>

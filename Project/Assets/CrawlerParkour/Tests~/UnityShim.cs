@@ -21,6 +21,10 @@ namespace UnityEngine
         public static Vector3 operator /(Vector3 a, float s) => new Vector3(a.x / s, a.y / s, a.z / s);
         public static float Dot(Vector3 a, Vector3 b) => a.x * b.x + a.y * b.y + a.z * b.z;
         public static Vector3 Scale(Vector3 a, Vector3 b) => new Vector3(a.x * b.x, a.y * b.y, a.z * b.z);
+        public static bool operator ==(Vector3 a, Vector3 b) => a.x == b.x && a.y == b.y && a.z == b.z;
+        public static bool operator !=(Vector3 a, Vector3 b) => !(a == b);
+        public override bool Equals(object o) => o is Vector3 v && this == v;
+        public override int GetHashCode() => x.GetHashCode() ^ y.GetHashCode() ^ z.GetHashCode();
         public override string ToString() => $"({x:F2},{y:F2},{z:F2})";
     }
 
@@ -42,6 +46,13 @@ namespace UnityEngine
                 cx * cy * sz - sx * sy * cz,
                 cx * cy * cz + sx * sy * sz);
         }
+
+        public static bool operator ==(Quaternion a, Quaternion b)
+            => a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+        public static bool operator !=(Quaternion a, Quaternion b) => !(a == b);
+        public override bool Equals(object o) => o is Quaternion q && this == q;
+        public override int GetHashCode()
+            => x.GetHashCode() ^ y.GetHashCode() ^ z.GetHashCode() ^ w.GetHashCode();
 
         public static Vector3 operator *(Quaternion q, Vector3 v)
         {
@@ -76,7 +87,17 @@ namespace UnityEngine
         public static float Sqrt(float v) => (float)Math.Sqrt(v);
     }
 
-    public class Object { }
+    public static class Debug
+    {
+        public static void LogError(object m) => Console.Error.WriteLine($"[error] {m}");
+        public static void LogWarning(object m) => Console.Error.WriteLine($"[warn] {m}");
+        public static void Log(object m) => Console.WriteLine(m);
+    }
+
+    public class Object { public string name = ""; }
+    // Null here, which is what the harness relies on: it drives the generator with
+    // no GameObject behind it, so the track frame is world space and the transform
+    // guard in Generate() is skipped.
     public class Component : Object { public Transform transform; }
     public class Behaviour : Component { }
     public class MonoBehaviour : Behaviour
@@ -90,8 +111,12 @@ namespace UnityEngine
     public class Transform : Component
     {
         public Vector3 localScale;
+        public Vector3 position;
+        public Quaternion rotation;
+        public Vector3 lossyScale;
         public GameObject gameObject;
         public void SetPositionAndRotation(Vector3 p, Quaternion r) { }
+        public void SetLocalPositionAndRotation(Vector3 p, Quaternion r) { }
         public T GetComponent<T>() where T : class => null;
     }
     public class GameObject : Object

@@ -67,7 +67,12 @@ namespace CrawlerParkour
         {
             if (Track == null || Reference == null || budget <= 0) return;
 
-            var p = Reference.position;
+            // The generator works in the track's own frame so arenas can be
+            // replicated by translation. Everything below is track space; the
+            // emitted node positions convert back at the end, because the sensor
+            // expresses them relative to its virtual root in world space.
+            var origin = Track.Origin;
+            var p = Reference.position - origin;
             m_Candidates.Clear();
             m_Distances.Clear();
             m_ClosestPoints.Clear();
@@ -78,7 +83,7 @@ namespace CrawlerParkour
                 var b = boxes[i];
                 // Longitudinal window first: rejects most of the track without
                 // touching the closest-point maths.
-                if (b.WorldMax.z < p.z - LookBehind || b.WorldMin.z > p.z + LookAhead) continue;
+                if (b.BoundsMax.z < p.z - LookBehind || b.BoundsMin.z > p.z + LookAhead) continue;
                 var q = b.ClosestPoint(p);
                 m_Candidates.Add(b);
                 m_ClosestPoints.Add(q);
@@ -107,7 +112,9 @@ namespace CrawlerParkour
                 var q = m_ClosestPoints[k];
                 into.Add(new EGNNEntity
                 {
-                    Position = q,
+                    // Back to world space. CenterOffset and Extent are differences
+                    // and lengths, so the translation leaves them alone.
+                    Position = q + origin,
                     Rotation = b.Rotation,
                     LinearVelocity = Vector3.zero,
                     AngularVelocity = Vector3.zero,
