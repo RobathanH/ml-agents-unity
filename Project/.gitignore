@@ -68,3 +68,6 @@
 *.vscode/
 
 .DS_Store
+
+# Hand-written, not Unity-generated: the CrawlerParkour feasibility harness
+!Assets/CrawlerParkour/Tests~/TrackFeasibility.csproj

@@ -165,3 +165,6 @@ Project/Assets/CrawlerSumo/Models/
 Project/Assets/CrawlerSumo/Models.meta
 Project/Assets/ML-Agents/Examples/Crawler/TFModels/Crawler_trained.onnx*
 Project/Assets/ML-Agents/Examples/PushBlock/TFModels/PushBlock_custom.onnx*
+# dotnet build output for the CrawlerParkour feasibility harness
+Project/Assets/CrawlerParkour/Tests~/bin/
+Project/Assets/CrawlerParkour/Tests~/obj/
