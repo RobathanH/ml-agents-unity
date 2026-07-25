@@ -6,6 +6,18 @@ behaviors:
       hidden_units: 512
       num_layers: 4
       vis_encode_type: simple
+      # Run 013: recurrent core. Runs 006-012 were feedforward, so feints,
+      # timing and setup-then-commit were not representable -- the policy could
+      # only ever produce reflexes, which caps how "intentional" behaviour can
+      # look regardless of training length. memory_size 512 -> LSTM hidden 256.
+      # NOT the default 256: NetworkBody feeds memory_size/2 to the output heads
+      # (networks.py ~L253/L473), so 256 would have narrowed the head input from
+      # 512 to 128 -- adding memory and shrinking the network in one change,
+      # with no way to attribute the result. Compute is ~2% of the EGNN encoder,
+      # which dominates forward cost at ~38M MACs (228 edge-MLP evals/layer).
+      memory:
+        memory_size: 512
+        sequence_length: 32
       egnn_encoders:
         enabled: true
         auto: true # applies automatically to EGNN-named variable-length sensors only
@@ -17,8 +29,13 @@ behaviors:
           pos_dim: 3
           embedding_size: 128
     hyperparameters:
-      batch_size: 2048
-      buffer_size: 20480
+      # Run 013: 2048 -> 4096 (buffer scaled to keep the 10x ratio). With memory
+      # enabled, batch_size still counts timesteps but gradients are effectively
+      # over batch_size/sequence_length = 128 independent sequences; at the old
+      # 2048 that would have been 32, a large jump in gradient noise on a run
+      # that already destabilised late.
+      batch_size: 4096
+      buffer_size: 40960
       # Run 008: 0.001 -> 0.0003. Run 007's value loss exploded (2.5 -> 20) and
       # entropy rose late (1.42 -> 2.28) once rewards got bigger; stabilize.
       learning_rate: 0.0003
@@ -26,13 +43,26 @@ behaviors:
       epsilon: 0.2
       lambd: 0.95
       num_epoch: 3
-      learning_rate_schedule: constant
+      # Run 013: constant -> linear. Run 012 ended at entropy 0.4985 with a
+      # negative ELO slope -- the policy never sharpened, so late training
+      # churned between styles instead of converging. beta decays with it;
+      # epsilon is pinned constant on purpose (settings.py L51-57 silently
+      # inherits both schedules from learning_rate_schedule, and decaying the
+      # clip range on top of LR and beta makes late updates conservative in
+      # three ways at once).
+      learning_rate_schedule: linear
+      beta_schedule: linear
+      epsilon_schedule: constant
     reward_signals:
       extrinsic:
         gamma: 0.995
         strength: 1.0
     keep_checkpoints: 5
-    max_steps: 300000000
+    # Run 013: 300M -> 80M. This is the schedule DENOMINATOR, not just a cap:
+    # linear decay interpolates to zero at max_steps, so leaving it at 300M for
+    # a run that stops near 80M would decay LR only 3e-4 -> 2.2e-4 and make the
+    # annealing change above a silent no-op. Run 012 reached 79.4M in 24h.
+    max_steps: 80000000
     time_horizon: 1000
     summary_freq: 1000 #10000
     self_play:
@@ -112,7 +142,12 @@ environment_parameters:
   center_control_reward: 0.03
 
   # Reward for velocity of opponent away from center (opponent vel away - self vel away) (vel toward center is ignored)
-  pushing_reward: 2.0
+  # Run 013: 2.0 -> 0.3. This dense per-step term pays continuously for keeping
+  # contact and shoving, and pays nothing for a committed action that misses --
+  # it is a direct description of the low shuffle-and-grind behaviour runs
+  # 011/012 converged to. center_control_reward got this same audit mid-008
+  # (0.2 -> 0.03) for the same reason; pushing never did.
+  pushing_reward: 0.3
 
   # Terminal reward for winning (one opponent falls off)
   # Run 008: back to 5 (8 inflated return variance -> value-loss blowup in 007);
@@ -124,5 +159,35 @@ environment_parameters:
 
   # Reward for body stability (upright-ness)
   stability_reward: 0.01
+
+  # ------------------------- Run 013: control costs -------------------------
+  # Per-agent (NOT zero-sum -- a relative cost cancels when both agents share a
+  # habit, which is exactly the equilibrium being broken). Applied per decision
+  # in CrawlerSumoAgent.ApplyControlCosts; both crawlers pay the same function.
+
+  # Metabolic cost: mean squared normalized joint strength over action dims
+  # 12-19. Without it, max stiffness is strictly dominant, so 8 of the 20 action
+  # dims saturate and go dead -- control degenerates to bang-bang targets
+  # against rigid PD joints, which is the source of the jerking.
+  energy_cost_weight: 0.005
+
+  # Smoothness cost: mean squared change in the action vector between
+  # consecutive decisions (DecisionPeriod 5, TakeActionsBetweenDecisions off,
+  # so these are true consecutive decisions). Jitter was previously free.
+  action_rate_cost_weight: 0.01
+
+  # DIAGNOSTICS ONLY -- must mirror reward_signals.extrinsic.gamma above. The
+  # environment cannot see trainer settings, so this is duplicated by hand; if
+  # you change gamma, change this too. Used only to weight the EpRewardDisc/*
+  # stats, never the reward sent to the trainer, so drift corrupts the
+  # diagnostic and nothing else. Sanity check: EpRewardDisc/FinalDiscount should
+  # equal gamma^(episode length in DECISIONS), i.e. 0.995^300 = 0.222 at the cap.
+  stats_gamma: 0.995
+
+  # SIZING IS A GUESS and is the first thing to check at the 5h judgment. Target
+  # is that EpReward/EnergyCost + EpReward/ActionRateCost land around 10-20% of
+  # EpReward/Terminal in magnitude. Much more and the policy buys stillness
+  # (the ring punishes that, but it will still distort); much less and jitter
+  # stays free. The new EpReward/* stats exist to make this a measurement.
 
 

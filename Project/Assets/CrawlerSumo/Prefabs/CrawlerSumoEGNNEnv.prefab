@@ -1687,7 +1687,7 @@ MonoBehaviour:
   m_MaxEntities: 19
   m_IncludeRotation: 1
   m_IncludeLinearVelocity: 1
-  m_IncludeAngularVelocity: 0
+  m_IncludeAngularVelocity: 1
   m_VirtualRoot: {fileID: 5958590990083142771}
   m_RootGroups:
   - Root: {fileID: 5381784872057328812}
@@ -2134,7 +2134,7 @@ MonoBehaviour:
   m_MaxEntities: 19
   m_IncludeRotation: 1
   m_IncludeLinearVelocity: 1
-  m_IncludeAngularVelocity: 0
+  m_IncludeAngularVelocity: 1
   m_VirtualRoot: {fileID: 5958590990083142771}
   m_RootGroups:
   - Root: {fileID: 3988653138003104299}

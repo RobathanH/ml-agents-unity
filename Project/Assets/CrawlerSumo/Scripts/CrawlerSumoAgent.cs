@@ -39,6 +39,30 @@ public class CrawlerSumoAgent : Agent
     public Vector3 platformCenter = Vector3.zero;
     public float platformRadius = 15f;
 
+    // Run 013 control costs. Weights are pushed in by the env controller from
+    // environment_parameters; 0 disables (runs 006-012 behaviour exactly).
+    [System.NonSerialized] public float energyCostWeight;
+    [System.NonSerialized] public float actionRateCostWeight;
+
+    // Per-episode totals, read by the env controller for the reward breakdown
+    // stats just before EndEpisode(). Reported as positive magnitudes.
+    // Disc = weighted by gamma^(decision index), i.e. the term's contribution to
+    // V(s_0) rather than its raw mass. Control costs accrue once per decision,
+    // so the agent tracks its own discount exactly.
+    public float EpisodeEnergyCost { get; private set; }
+    public float EpisodeActionRateCost { get; private set; }
+    public float EpisodeEnergyCostDisc { get; private set; }
+    public float EpisodeActionRateCostDisc { get; private set; }
+
+    // Diagnostics only; mirrors reward_signals.extrinsic.gamma. Set by controller.
+    [System.NonSerialized] public float statsGamma = 1f;
+    private float m_Discount = 1f;
+
+    // Actions 12-19 are per-joint strength (see OnActionReceived).
+    private const int k_NumStrengthActions = 8;
+    private float[] m_PrevActions;
+    private bool m_HasPrevActions;
+
     private JointDriveController m_JdController;
 
     public override void Initialize()
@@ -82,6 +106,15 @@ public class CrawlerSumoAgent : Agent
         {
             bodyPart.Reset(bodyPart);
         }
+
+        // No action-rate cost across an episode boundary: the first decision of
+        // a new episode has no meaningful predecessor.
+        m_HasPrevActions = false;
+        EpisodeEnergyCost = 0f;
+        EpisodeActionRateCost = 0f;
+        EpisodeEnergyCostDisc = 0f;
+        EpisodeActionRateCostDisc = 0f;
+        m_Discount = 1f;
     }
 
     /// <summary>
@@ -239,6 +272,81 @@ public class CrawlerSumoAgent : Agent
         bpDict[leg1Lower].SetJointStrength(continuous[++i]);
         bpDict[leg2Lower].SetJointStrength(continuous[++i]);
         bpDict[leg3Lower].SetJointStrength(continuous[++i]);
+
+        ApplyControlCosts(continuous);
+    }
+
+    /// <summary>
+    /// Run 013: metabolic + action-rate costs.
+    ///
+    /// Deliberately NOT zero-sum, unlike every other term in this environment.
+    /// A relative cost cancels when both agents share a habit, which is exactly
+    /// the equilibrium we are trying to break -- mutual jitter would go unpriced.
+    /// Both crawlers pay the identical cost function, so competitive fairness
+    /// (the reason the other terms are zero-sum) is preserved.
+    ///
+    /// Why energy matters here: actions 12-19 feed SetJointStrength, which maps
+    /// a -> (a+1)/2 of maxJointForceLimit. With no cost, maximum stiffness is
+    /// strictly dominant, so those 8 dims saturate and become dead -- control
+    /// collapses to bang-bang target rotations against rigid PD joints, which is
+    /// what produced runs 006-012's jerking. Pricing strength makes stiffness a
+    /// real decision (stiffen to drive, relax to swing a limb).
+    /// </summary>
+    private void ApplyControlCosts(ActionSegment<float> continuous)
+    {
+        int n = continuous.Length;
+        if (m_PrevActions == null || m_PrevActions.Length != n)
+        {
+            m_PrevActions = new float[n];
+            m_HasPrevActions = false;
+        }
+
+        if (energyCostWeight > 0f || actionRateCostWeight > 0f)
+        {
+            // Energy: mean squared normalized joint strength over the strength dims.
+            float energy = 0f;
+            int strengthStart = Mathf.Max(0, n - k_NumStrengthActions);
+            int strengthCount = n - strengthStart;
+            for (int a = strengthStart; a < n; a++)
+            {
+                float normStrength = (continuous[a] + 1f) * 0.5f; // -> [0, 1]
+                energy += normStrength * normStrength;
+            }
+            energy = strengthCount > 0 ? energy / strengthCount : 0f;
+
+            // Action rate: mean squared change since the previous decision.
+            // DecisionRequester has TakeActionsBetweenDecisions = 0, so
+            // OnActionReceived fires once per decision -- these are genuine
+            // consecutive decisions, not repeated frames of the same action.
+            float rate = 0f;
+            if (m_HasPrevActions)
+            {
+                for (int a = 0; a < n; a++)
+                {
+                    float d = continuous[a] - m_PrevActions[a];
+                    rate += d * d;
+                }
+                rate /= n;
+            }
+
+            float energyCost = energyCostWeight * energy;
+            float rateCost = actionRateCostWeight * rate;
+            EpisodeEnergyCost += energyCost;
+            EpisodeActionRateCost += rateCost;
+            EpisodeEnergyCostDisc += energyCost * m_Discount;
+            EpisodeActionRateCostDisc += rateCost * m_Discount;
+            AddReward(-(energyCost + rateCost));
+        }
+
+        // Advance after applying: the first decision of an episode is index 0
+        // and must carry discount 1.
+        m_Discount *= statsGamma;
+
+        for (int a = 0; a < n; a++)
+        {
+            m_PrevActions[a] = continuous[a];
+        }
+        m_HasPrevActions = true;
     }
 
     private void FixedUpdate()

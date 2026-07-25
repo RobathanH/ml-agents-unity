@@ -60,6 +60,87 @@ public class CrawlerSumoEnvController : MonoBehaviour
     private float bodyGroundPenalty = 0.005f;
     private float stabilityReward = 0.002f;
 
+    // Run 013 control costs, applied per-agent inside CrawlerSumoAgent. 0 disables.
+    private float energyCostWeight = 0f;
+    private float actionRateCostWeight = 0f;
+
+    /// <summary>
+    /// One reward component's episode total, tracked two ways.
+    ///
+    /// Raw is the undiscounted sum: the right lens for "is the reward function
+    /// well-posed", i.e. does a shaping term carry enough mass to move the
+    /// argmax (the runs 007/008 failure).
+    ///
+    /// Disc weights each contribution by gamma^(decision index), making it the
+    /// component's share of V(s_0) -- what the policy actually optimises. The
+    /// two differ a lot here, and not uniformly: dense shaping accrues
+    /// throughout the episode and keeps ~52% of its mass at gamma 0.995 over
+    /// 300 decisions, while terminal reward sits entirely at T and keeps only
+    /// ~22%. Reading Raw alone overstates the win condition's pull by ~2.3x.
+    /// (Second-order, not captured here: with GAE lambda 0.95 the advantage's
+    /// effective horizon is ~18 decisions, so terminal reward reaches early
+    /// decisions almost entirely through the value function -- when value loss
+    /// is high, its real influence is weaker still than Disc suggests.)
+    /// </summary>
+    private struct RewardTerm
+    {
+        public float Raw;
+        public float Disc;
+
+        public void Add(float v, float discount)
+        {
+            Raw += v;
+            Disc += v * discount;
+        }
+
+        public void Clear()
+        {
+            Raw = 0f;
+            Disc = 0f;
+        }
+    }
+
+    /// <summary>
+    /// Per-episode reward totals, one instance per crawler. Recorded once at
+    /// episode end, in the same units as winReward. Per-step means cannot show
+    /// shaping-vs-terminal imbalance; these can.
+    /// </summary>
+    private struct RewardBreakdown
+    {
+        public RewardTerm Survival;
+        public RewardTerm CenterControl;
+        public RewardTerm Pushing;
+        public RewardTerm Stability;
+        public RewardTerm BodyGround;
+        public RewardTerm Terminal;
+
+        public float ShapingRaw =>
+            Survival.Raw + CenterControl.Raw + Pushing.Raw + Stability.Raw + BodyGround.Raw;
+
+        public float ShapingDisc =>
+            Survival.Disc + CenterControl.Disc + Pushing.Disc + Stability.Disc + BodyGround.Disc;
+
+        public void Clear()
+        {
+            Survival.Clear();
+            CenterControl.Clear();
+            Pushing.Clear();
+            Stability.Clear();
+            BodyGround.Clear();
+            Terminal.Clear();
+        }
+    }
+
+    private RewardBreakdown m_C1Rewards;
+    private RewardBreakdown m_C2Rewards;
+
+    // gamma^(current decision index), for the Disc totals above. Diagnostics
+    // only -- never touches the reward actually sent to the trainer.
+    private float m_StatsGamma = 0.995f;
+    private int m_DecisionPeriod = 1;
+    private float m_Discount = 1f;
+    private int m_DiscountDecisionIndex;
+
     private int m_StepCount;
     private float m_C1StartY;
     private float m_C2StartY;
@@ -154,6 +235,28 @@ public class CrawlerSumoEnvController : MonoBehaviour
         winReward = GetParam("win_reward", winReward);
         bodyGroundPenalty = GetParam("body_ground_penalty", bodyGroundPenalty);
         stabilityReward = GetParam("stability_reward", stabilityReward);
+
+        // Control costs (run 013). Pushed down to the agents, which apply them
+        // in OnActionReceived where the action vector is available.
+        energyCostWeight = GetParam("energy_cost_weight", energyCostWeight);
+        actionRateCostWeight = GetParam("action_rate_cost_weight", actionRateCostWeight);
+        crawler1.energyCostWeight = energyCostWeight;
+        crawler2.energyCostWeight = energyCostWeight;
+        crawler1.actionRateCostWeight = actionRateCostWeight;
+        crawler2.actionRateCostWeight = actionRateCostWeight;
+
+        // Diagnostics only: must mirror reward_signals.extrinsic.gamma, which
+        // is trainer-side and not visible to the environment. If they drift,
+        // the EpRewardDisc/* stats are wrong but training is unaffected.
+        m_StatsGamma = GetParam("stats_gamma", m_StatsGamma);
+        crawler1.statsGamma = m_StatsGamma;
+        crawler2.statsGamma = m_StatsGamma;
+
+        // gamma is per DECISION, not per physics step: AddReward accumulates
+        // across the intermediate FixedUpdates and is delivered at the next
+        // decision, so all 5 physics steps share one discount exponent.
+        var dr = crawler1.GetComponent<DecisionRequester>();
+        m_DecisionPeriod = dr != null ? Mathf.Max(1, dr.DecisionPeriod) : 1;
 
         // Shrinking ring
         ringShrinkStartStep = Mathf.RoundToInt(GetParam("ring_shrink_start_step", ringShrinkStartStep));
@@ -276,8 +379,25 @@ public class CrawlerSumoEnvController : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Advance gamma^(decision index) to match the current physics step.
+    /// m_StepCount is incremented at the top of FixedUpdate, so the episode's
+    /// first physics step is decision index 0 (discount 1).
+    /// </summary>
+    private void UpdateDiscount()
+    {
+        int decisionIndex = Mathf.Max(0, m_StepCount - 1) / m_DecisionPeriod;
+        while (m_DiscountDecisionIndex < decisionIndex)
+        {
+            m_Discount *= m_StatsGamma;
+            m_DiscountDecisionIndex++;
+        }
+    }
+
     private void ApplyZeroSumRewards()
     {
+        UpdateDiscount();
+
         Vector3 c1Pos = crawler1.body.position;
         Vector3 c2Pos = crawler2.body.position;
         
@@ -300,11 +420,15 @@ public class CrawlerSumoEnvController : MonoBehaviour
         {
             crawler1.AddReward(survivalReward);
             crawler2.AddReward(-survivalReward);
+            m_C1Rewards.Survival.Add(survivalReward, m_Discount);
+            m_C2Rewards.Survival.Add(-survivalReward, m_Discount);
         }
         else if (c2OnPlatform > 0f && c1OnPlatform == 0f)
         {
             crawler2.AddReward(survivalReward);
             crawler1.AddReward(-survivalReward);
+            m_C2Rewards.Survival.Add(survivalReward, m_Discount);
+            m_C1Rewards.Survival.Add(-survivalReward, m_Discount);
         }
 
         // Center control reward - zero-sum based on who's closer to center
@@ -318,7 +442,9 @@ public class CrawlerSumoEnvController : MonoBehaviour
             
             crawler1.AddReward(c1CenterReward);
             crawler2.AddReward(c2CenterReward);
-            
+            m_C1Rewards.CenterControl.Add(c1CenterReward, m_Discount);
+            m_C2Rewards.CenterControl.Add(c2CenterReward, m_Discount);
+
             RecordStatForLearningAgent("CenterControlReward", c1CenterReward, crawler1);
             RecordStatForLearningAgent("CenterControlReward", c2CenterReward, crawler2);
         }
@@ -340,7 +466,9 @@ public class CrawlerSumoEnvController : MonoBehaviour
         
         crawler1.AddReward(c1PushReward - c2PushReward);
         crawler2.AddReward(c2PushReward - c1PushReward);
-        
+        m_C1Rewards.Pushing.Add(c1PushReward - c2PushReward, m_Discount);
+        m_C2Rewards.Pushing.Add(c2PushReward - c1PushReward, m_Discount);
+
         RecordStatForLearningAgent("PushingReward", c1PushReward - c2PushReward, crawler1);
         RecordStatForLearningAgent("PushingReward", c2PushReward - c1PushReward, crawler2);
 
@@ -354,7 +482,9 @@ public class CrawlerSumoEnvController : MonoBehaviour
         
         crawler1.AddReward(c1StabilityReward);
         crawler2.AddReward(c2StabilityReward);
-        
+        m_C1Rewards.Stability.Add(c1StabilityReward, m_Discount);
+        m_C2Rewards.Stability.Add(c2StabilityReward, m_Discount);
+
         RecordStatForLearningAgent("StabilityReward", c1StabilityReward, crawler1);
         RecordStatForLearningAgent("StabilityReward", c2StabilityReward, crawler2);
 
@@ -370,11 +500,18 @@ public class CrawlerSumoEnvController : MonoBehaviour
         {
             crawler1.AddReward(c1BodyPenalty);
             crawler2.AddReward(-c1BodyPenalty);
+            // Accumulate what was actually applied, not the notional penalty:
+            // in the both-touching branch nothing is added, so the per-step
+            // stat below over-reports while these episode totals do not.
+            m_C1Rewards.BodyGround.Add(c1BodyPenalty, m_Discount);
+            m_C2Rewards.BodyGround.Add(-c1BodyPenalty, m_Discount);
         }
         else if (c2BodyTouching && !c1BodyTouching)
         {
             crawler2.AddReward(c2BodyPenalty);
             crawler1.AddReward(-c2BodyPenalty);
+            m_C2Rewards.BodyGround.Add(c2BodyPenalty, m_Discount);
+            m_C1Rewards.BodyGround.Add(-c2BodyPenalty, m_Discount);
         }
         else if (c1BodyTouching && c2BodyTouching)
         {
@@ -471,6 +608,16 @@ public class CrawlerSumoEnvController : MonoBehaviour
         }
         m_LastEndWasFlip = false;
         MatchEnded?.Invoke(this, c1TerminalReward);
+
+        // Reward breakdown must be recorded BEFORE EndEpisode(), which triggers
+        // OnEpisodeBegin() and clears the agents' control-cost accumulators.
+        // CheckFallConditions can end the episode before ApplyZeroSumRewards
+        // runs this step, so refresh the discount before stamping the terminal.
+        UpdateDiscount();
+        m_C1Rewards.Terminal.Add(c1TerminalReward, m_Discount);
+        m_C2Rewards.Terminal.Add(c2TerminalReward, m_Discount);
+        RecordRewardBreakdown(crawler1, m_C1Rewards);
+        RecordRewardBreakdown(crawler2, m_C2Rewards);
         // Record win/loss statistics
         float c1WinReward = (c1TerminalReward > 0f) ? c1TerminalReward : 0f;
         float c2WinReward = (c2TerminalReward > 0f) ? c2TerminalReward : 0f;
@@ -491,11 +638,70 @@ public class CrawlerSumoEnvController : MonoBehaviour
         EndBothEpisodesWithWinInfo(c1TerminalReward, c2TerminalReward);
     }
 
+    /// <summary>
+    /// Emit every reward component as an episode total, in the same units as
+    /// winReward. Read these together: if ShapingTotal rivals or exceeds
+    /// Terminal, shaping is defining the objective rather than guiding it, and
+    /// the policy will optimise the shaping term (runs 007/008). EnergyCost and
+    /// ActionRateCost are recorded as their signed contribution to return, so
+    /// every key sums to Total.
+    /// </summary>
+    private void RecordRewardBreakdown(CrawlerSumoAgent agent, RewardBreakdown r)
+    {
+        if (m_Recorder == null) return;
+
+        float energyCost = agent.EpisodeEnergyCost;
+        float rateCost = agent.EpisodeActionRateCost;
+        float energyCostDisc = agent.EpisodeEnergyCostDisc;
+        float rateCostDisc = agent.EpisodeActionRateCostDisc;
+
+        // Undiscounted mass: is the reward function well-posed?
+        RecordStatForLearningAgent("EpReward/Survival", r.Survival.Raw, agent);
+        RecordStatForLearningAgent("EpReward/CenterControl", r.CenterControl.Raw, agent);
+        RecordStatForLearningAgent("EpReward/Pushing", r.Pushing.Raw, agent);
+        RecordStatForLearningAgent("EpReward/Stability", r.Stability.Raw, agent);
+        RecordStatForLearningAgent("EpReward/BodyGround", r.BodyGround.Raw, agent);
+        RecordStatForLearningAgent("EpReward/EnergyCost", -energyCost, agent);
+        RecordStatForLearningAgent("EpReward/ActionRateCost", -rateCost, agent);
+        RecordStatForLearningAgent("EpReward/ShapingTotal", r.ShapingRaw, agent);
+        RecordStatForLearningAgent("EpReward/Terminal", r.Terminal.Raw, agent);
+        RecordStatForLearningAgent(
+            "EpReward/Total", r.ShapingRaw + r.Terminal.Raw - energyCost - rateCost, agent);
+        RecordStatForLearningAgent("EpReward/EpisodeSteps", m_StepCount, agent);
+
+        // gamma-weighted: what the policy actually optimises. Compare
+        // EpRewardDisc/ShapingTotal against EpRewardDisc/Terminal -- the raw
+        // pair above flatters the terminal by ~2.3x at gamma 0.995 over a
+        // full-length episode, because shaping accrues throughout while the
+        // terminal sits entirely at T.
+        RecordStatForLearningAgent("EpRewardDisc/Survival", r.Survival.Disc, agent);
+        RecordStatForLearningAgent("EpRewardDisc/CenterControl", r.CenterControl.Disc, agent);
+        RecordStatForLearningAgent("EpRewardDisc/Pushing", r.Pushing.Disc, agent);
+        RecordStatForLearningAgent("EpRewardDisc/Stability", r.Stability.Disc, agent);
+        RecordStatForLearningAgent("EpRewardDisc/BodyGround", r.BodyGround.Disc, agent);
+        RecordStatForLearningAgent("EpRewardDisc/EnergyCost", -energyCostDisc, agent);
+        RecordStatForLearningAgent("EpRewardDisc/ActionRateCost", -rateCostDisc, agent);
+        RecordStatForLearningAgent("EpRewardDisc/ShapingTotal", r.ShapingDisc, agent);
+        RecordStatForLearningAgent("EpRewardDisc/Terminal", r.Terminal.Disc, agent);
+        RecordStatForLearningAgent(
+            "EpRewardDisc/Total",
+            r.ShapingDisc + r.Terminal.Disc - energyCostDisc - rateCostDisc, agent);
+        // Sanity check that this env's gamma matches the trainer's: this is
+        // V(s_0) under the recorded gamma, and should track the trainer's own
+        // value estimate. A persistent gap means stats_gamma has drifted from
+        // reward_signals.extrinsic.gamma.
+        RecordStatForLearningAgent("EpRewardDisc/FinalDiscount", m_Discount, agent);
+    }
+
     private void ResetSumo()
     {
         m_StepCount = 0;
         m_C1FlipSteps = 0;
         m_C2FlipSteps = 0;
+        m_C1Rewards.Clear();
+        m_C2Rewards.Clear();
+        m_Discount = 1f;
+        m_DiscountDecisionIndex = 0;
 
         // Per-episode physics randomization (same values for both crawlers)
         if (m_C1Jd != null && (jointStrengthMultMin != 1f || jointStrengthMultMax != 1f))
