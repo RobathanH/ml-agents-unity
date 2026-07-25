@@ -68,7 +68,9 @@ Per the requirement to share EGNN node types rather than minting a one-hot per
 semantic role, the type vocabulary is **geometric and kinematic only**:
 
 - `type` ∈ {`self`, `obstacle`} — 2 slots
-- `subtype` ∈ {`body`, `upper`, `lower`, `foot`, `static`, `dynamic`} — 6 slots
+- `subtype` ∈ {`body`, `upper`, `lower`, `static`, `dynamic`} — 5 slots
+
+(The crawler's lower legs are its feet; there is no separate foot segment.)
 
 A wall, a ramp, a ledge, a pebble and the floor are all `obstacle/static`. They
 are distinguished by their **geometry**, which the sensor transmits losslessly

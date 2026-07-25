@@ -1,0 +1,141 @@
+behaviors:
+  CrawlerParkour:
+    trainer_type: ppo
+    network_settings:
+      normalize: true
+      hidden_units: 512
+      num_layers: 4
+      vis_encode_type: simple
+      # Recurrent for the same reason as CrawlerSumo run 013, but the need is
+      # sharper here: an obstacle leaves the sensor window before it has been
+      # cleared, so committing to a jump requires remembering what was there.
+      # A feedforward policy cannot represent "I am mid-leap over a gap".
+      # memory_size 512 -> LSTM hidden 256; NOT 256, because NetworkBody feeds
+      # memory_size/2 to the output heads and that would silently halve the
+      # head input while adding memory.
+      memory:
+        memory_size: 512
+        sequence_length: 64
+      egnn_encoders:
+        enabled: true
+        auto: true
+        defaults:
+          hidden_dim: 128
+          message_dim: 64
+          num_layers: 3
+          # 25 entities (9 self + 16 obstacles) vs CrawlerSumo's 19, and the
+          # obstacle nodes sit on surfaces rather than centroids, so the useful
+          # neighbourhood is denser. 12 -> 16 keeps roughly the same fraction of
+          # the graph visible per node.
+          k_neighbors: 16
+          pos_dim: 3
+          embedding_size: 128
+          # MUST mirror the EGNNSensorComponent toggles -- see SETUP.md. A
+          # mismatch silently reinterprets geometry columns as one-hots.
+          # Row: pos(3) quat(4) linvel(3) angvel(3) center_offset(3) extent(3)
+          #      type(2) subtype(5) = 26
+          attr_mode: equivariant
+          has_quaternion: true
+          has_linear_velocity: true
+          has_angular_velocity: true
+          # Obstacle nodes are emitted at the closest point on the surface, not
+          # at the centroid; this is the displacement back to the centre, which
+          # keeps the box encoding lossless.
+          has_center_offset: true
+    hyperparameters:
+      batch_size: 4096
+      buffer_size: 40960
+      learning_rate: 0.0003
+      beta: 0.005
+      epsilon: 0.2
+      lambd: 0.95
+      num_epoch: 3
+      learning_rate_schedule: linear
+      beta_schedule: linear
+      # Pinned constant deliberately: settings.py inherits both schedules from
+      # learning_rate_schedule unless told otherwise, and decaying the clip
+      # range on top of LR and beta makes late updates conservative three ways
+      # at once.
+      epsilon_schedule: constant
+    reward_signals:
+      extrinsic:
+        gamma: 0.995
+        strength: 1.0
+    keep_checkpoints: 5
+    # Schedule denominator, not just a cap: linear decay interpolates to zero
+    # here, so this must match the run length actually intended.
+    max_steps: 80000000
+    time_horizon: 1000
+    summary_freq: 10000
+    # No self_play block. Parkour is single-agent against a fixed task, so
+    # there is no ghost-trainer non-stationarity -- which also means progress is
+    # readable directly from reward instead of needing ELO.
+
+environment_parameters:
+  max_episode_steps: 3000
+
+  # Reward shape. Progress dominates; everything else prices a cost.
+  progress_weight: 10.0
+  finish_bonus: 5.0
+  # A respawn already costs the time to re-cover the ground (progress pays only
+  # on max-so-far), so this is a nudge, not the real price of failure. Keeping
+  # it small is the point: a large terminal-feeling penalty reproduces sumo's
+  # conservative shuffle.
+  respawn_penalty: 0.5
+  fall_depth: 3.0
+
+  # Control costs, carried over from CrawlerSumo run 013. Without an energy
+  # cost the 8 strength dims saturate at maximum stiffness (strictly dominant)
+  # and control collapses to bang-bang targets against rigid PD joints.
+  energy_cost_weight: 0.002
+  action_rate_cost_weight: 0.002
+
+  # Single scalar driving every obstacle bound (see ParkourDifficulty).
+  #
+  # measure: reward, NOT progress. ML-Agents' "progress" measure is
+  # trainer_steps / max_steps -- elapsed training time, not how far the agent
+  # got -- so thresholds on it would make this a fixed clock schedule that
+  # advances whether or not the agent can handle the next lesson.
+  #
+  # Reward is readable here because progress_weight is 10 and progress reward is
+  # 10 * (fraction of track covered), so mean reward ~= 10 * fraction, shifted by
+  # the finish bonus (+2.5..5 when it finishes) and control costs (~-1.2 per
+  # episode). The thresholds below therefore sit at roughly 15 / 30 / 50 / 70
+  # percent of the track. They are approximate by construction: if the control
+  # cost weights change, re-derive them rather than assuming they still map.
+  difficulty:
+    curriculum:
+      - name: flat
+        completion_criteria:
+          measure: reward
+          behavior: CrawlerParkour
+          signal_smoothing: true
+          min_lesson_length: 100
+          threshold: 1.5
+        value: 0.0
+      - name: gentle
+        completion_criteria:
+          measure: reward
+          behavior: CrawlerParkour
+          signal_smoothing: true
+          min_lesson_length: 100
+          threshold: 3.0
+        value: 0.25
+      - name: moderate
+        completion_criteria:
+          measure: reward
+          behavior: CrawlerParkour
+          signal_smoothing: true
+          min_lesson_length: 100
+          threshold: 5.0
+        value: 0.5
+      - name: hard
+        completion_criteria:
+          measure: reward
+          behavior: CrawlerParkour
+          signal_smoothing: true
+          min_lesson_length: 100
+          threshold: 7.0
+        value: 0.75
+      - name: max
+        value: 1.0
