@@ -13,11 +13,18 @@ EXTRA_ARGS=("$@")
 
 REPO="$HOME/ml-agents"
 # Multi-arena build by default (12 arenas/process -> batched policy inference).
-# Override with ENV_BIN=... for the single-arena build.
+# Override with ENV_BIN=... for the single-arena build, and CONFIG=... to train
+# a different environment. Defaults are unchanged so existing CrawlerSumo
+# invocations behave exactly as before.
 ENV_BIN="${ENV_BIN:-$REPO/envs/CrawlerSumoEGNN_Multi_linux/CrawlerSumoEGNN.x86_64}"
+CONFIG="${CONFIG:-$REPO/config/ppo/CrawlerSumoEGNN.yaml}"
 
 if [ ! -f "$ENV_BIN" ]; then
     echo "ERROR: $ENV_BIN not found. Upload the Linux build first."
+    exit 1
+fi
+if [ ! -f "$CONFIG" ]; then
+    echo "ERROR: config $CONFIG not found."
     exit 1
 fi
 chmod +x "$ENV_BIN"
@@ -32,7 +39,7 @@ mkdir -p "$REPO/results"
 # xvfb-run: the Unity Linux player SIGSEGVs on headless hosts without a display
 # server (NULL strcasecmp in display probing), even with -nographics. A virtual
 # X display fixes it; all env worker subprocesses inherit it from the trainer.
-CMD="source $HOME/venv/bin/activate && cd $REPO && xvfb-run -a mlagents-learn config/ppo/CrawlerSumoEGNN.yaml \
+CMD="source $HOME/venv/bin/activate && cd $REPO && xvfb-run -a mlagents-learn $CONFIG \
  --env $ENV_BIN --run-id $RUN_ID --num-envs $NUM_ENVS --no-graphics --torch-device cuda \
  ${EXTRA_ARGS[*]:-} 2>&1 | tee -a $REPO/results/${RUN_ID}_console.log"
 
@@ -41,5 +48,7 @@ tmux new-window -t train -n tb \
     "bash -lc 'source $HOME/venv/bin/activate && tensorboard --logdir $REPO/results --port 6006'"
 
 echo "Started run '$RUN_ID' with $NUM_ENVS envs in tmux session 'train'."
+echo "  config:       $CONFIG"
+echo "  env binary:   $ENV_BIN"
 echo "  watch logs:   tmux attach -t train      (detach: Ctrl+b then d)"
 echo "  tensorboard:  ssh -L 6006:localhost:6006 ubuntu@<this-ip>  ->  http://localhost:6006"

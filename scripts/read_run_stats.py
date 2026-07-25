@@ -13,16 +13,45 @@ import sys
 from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
 
 STAGING = r"D:\UnityRL\ml-agents\results\cloud_staging"
-KEY_TAGS = [
-    "Self-play/ELO",
-    "Policy/Entropy",
+
+COMMON_TAGS = [
+    "Environment/Cumulative Reward",
     "Environment/Episode Length",
-    "CrawlerSumoLearner/PushingReward",
-    "CrawlerSumoLearner/WinReward",
-    "CrawlerSumoOpponent/WinReward",
-    "CrawlerSumo/FlipKnockdownEnd",  # run 011+: proportion of matches decided by flip
+    "Policy/Entropy",
     "Losses/Value Loss",
 ]
+
+# Per-behavior tags. The behavior name doubles as the events subdirectory.
+BEHAVIOR_TAGS = {
+    "CrawlerSumo": [
+        "Self-play/ELO",
+        "CrawlerSumoLearner/PushingReward",
+        "CrawlerSumoLearner/WinReward",
+        "CrawlerSumoOpponent/WinReward",
+        "CrawlerSumo/FlipKnockdownEnd",  # run 011+: matches decided by flip
+    ],
+    "CrawlerParkour": [
+        "CrawlerParkour/ProgressFraction",
+        "CrawlerParkour/Finished",
+        "CrawlerParkour/Respawns",
+        "CrawlerParkour/Difficulty",   # which curriculum lesson is live
+        "CrawlerParkour/FinishSteps",
+        "CrawlerParkour/EnergyCost",
+        "CrawlerParkour/ActionRateCost",
+        # Should sit at ~0. Sustained non-zero means a segment pattern is
+        # emitting geometry its own feasibility check rejects, so the track is
+        # quietly rebuilding itself as flat ground and the run is far easier
+        # than the difficulty parameter claims.
+        "CrawlerParkour/TrackRepairs",
+    ],
+}
+
+
+def find_behavior(run_dir):
+    for name in BEHAVIOR_TAGS:
+        if os.path.isdir(os.path.join(run_dir, name)):
+            return name
+    return None
 
 
 def main():
@@ -30,15 +59,23 @@ def main():
         run_id = sys.argv[1]
     else:
         runs = [d for d in os.listdir(STAGING)
-                if os.path.isdir(os.path.join(STAGING, d, "CrawlerSumo"))]
+                if find_behavior(os.path.join(STAGING, d))]
+        if not runs:
+            sys.exit(f"no staged runs under {STAGING}")
         run_id = max(runs, key=lambda d: os.path.getmtime(os.path.join(STAGING, d)))
 
+    run_dir = os.path.join(STAGING, run_id)
+    behavior = find_behavior(run_dir)
+    if behavior is None:
+        sys.exit(f"no known behavior directory under {run_dir}")
+    key_tags = COMMON_TAGS + BEHAVIOR_TAGS[behavior]
+
     files = sorted(glob.glob(
-        os.path.join(STAGING, run_id, "CrawlerSumo", "events.out.tfevents.*")))
+        os.path.join(run_dir, behavior, "events.out.tfevents.*")))
     if not files:
         sys.exit(f"no events for {run_id}")
 
-    series = {t: [] for t in KEY_TAGS}
+    series = {t: [] for t in key_tags}
     for f in files:
         for ev in EventFileLoader(f).Load():
             if not getattr(ev, "summary", None):
@@ -47,7 +84,7 @@ def main():
                 if v.tag in series and v.tensor.float_val:
                     series[v.tag].append((ev.step, v.tensor.float_val[0]))
 
-    print(f"run: {run_id}")
+    print(f"run: {run_id}  ({behavior})")
     for tag, pts in series.items():
         if not pts:
             continue
@@ -55,7 +92,7 @@ def main():
         s1, v1 = pts[-1]
         print(f"  {tag}: {v0:.4g} @ {s0/1e6:.1f}M -> {v1:.4g} @ {s1/1e6:.1f}M")
 
-    elo = series["Self-play/ELO"]
+    elo = series.get("Self-play/ELO", [])
     if len(elo) > 10:
         recent = [p for p in elo if p[0] >= elo[-1][0] - 3_000_000] or elo[-10:]
         ds = (recent[-1][0] - recent[0][0]) / 1e6

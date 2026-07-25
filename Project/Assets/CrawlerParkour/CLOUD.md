@@ -1,0 +1,86 @@
+# CrawlerParkour — cloud training runbook
+
+Same tooling and same guardrails as the CrawlerSumo runs. Nothing here has been
+launched; run 013 may still hold the one-instance budget.
+
+## Preconditions
+
+1. Unity scene built per [SETUP.md](SETUP.md), and the encoder's startup log line
+   shows `vec_channels=7` with `center_offset[13:16]` in the layout.
+2. Feasibility harness green:
+   ```
+   cd Project/Assets/CrawlerParkour/Tests~ && dotnet run -c Release
+   ```
+3. Linux build exported to `envs/CrawlerParkour_Multi_linux/` and archived as
+   `envs/CrawlerParkour_Multi_linux.tgz`.
+4. Branch `crawler-parkour` pushed, so the instance can clone it.
+
+## Launch
+
+```powershell
+.\scripts\lambda\cloud_train.ps1 `
+  -RunId CrawlerParkour_001 `
+  -TimeLimitHours 8 `
+  -Branch crawler-parkour `
+  -Config config/ppo/CrawlerParkour.yaml `
+  -EnvBin envs/CrawlerParkour_Multi_linux/CrawlerParkour.x86_64 `
+  -BuildTgz .\envs\CrawlerParkour_Multi_linux.tgz
+```
+
+`-Config` and `-EnvBin` default to empty, which leaves `launch_training.sh` on
+its CrawlerSumoEGNN defaults — sumo invocations are unchanged.
+
+Budget: `gpu_1x_a10` at $1.29/hr, ~$31 per 24h. One instance at a time.
+Stop and report rather than extending if a run passes 24h without clear
+improvement.
+
+## Monitoring
+
+```powershell
+.\scripts\lambda\cloud_status.ps1
+.\scripts\sync_cloud_staging.ps1
+python scripts\read_run_stats.py CrawlerParkour_001
+```
+
+### What to actually watch
+
+| Stat | Meaning |
+|---|---|
+| `CrawlerParkour/ProgressFraction` | the real objective — fraction of track covered |
+| `CrawlerParkour/Difficulty` | which curriculum lesson is live |
+| `CrawlerParkour/Finished` | proportion of episodes completing the track |
+| `CrawlerParkour/Respawns` | falls per episode; should fall as difficulty rises, and a *rise* with no progress gain means risk is mispriced |
+| `CrawlerParkour/TrackRepairs` | **must stay ~0** |
+
+`TrackRepairs` is the one that can silently invalidate a whole run. A sustained
+non-zero value means a segment pattern is emitting geometry its own feasibility
+check rejects, so those segments rebuild as flat ground — training proceeds
+happily on a track far easier than the difficulty parameter claims, and the
+reward curve looks *better* while the environment is quietly degrading.
+
+There is no ELO here. Parkour is single-agent against a fixed task, so reward is
+directly comparable across checkpoints and across runs at the same difficulty —
+which is a real advantage over the sumo runs, where the ghost trainer made
+absolute reward almost meaningless.
+
+## Evaluation
+
+Standalone eval builds have no python side channel, so any run whose physics or
+difficulty differed from the defaults must be evaluated with matching
+`--env-param` overrides, or the numbers are meaningless:
+
+```
+CrawlerParkour.exe --env-param difficulty=1.0 --env-param max_episode_steps=3000
+```
+
+Set `fixedSeed` on the env controller for a reproducible eval track — otherwise
+each episode draws a new layout and checkpoint-to-checkpoint comparisons carry
+the layout variance too.
+
+## First-run expectations
+
+Lesson `flat` (difficulty 0) is close to open ground: 12m wide, 0.2 steps, no
+pebbles. It exists so locomotion is solved before any obstacle reasoning is
+required. If reward is still under the 1.5 threshold after a few million steps
+the problem is locomotion or the observation wiring, not the track — check the
+height field is not reading the crawler's own legs (`GroundMask`).

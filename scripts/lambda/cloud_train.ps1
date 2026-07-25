@@ -23,6 +23,14 @@ param(
     [string]$ApiKeyFile = "C:\Users\rob\ssh_keys\lambda_api_key.txt",
     [string]$RepoUrl = "https://github.com/robathanh/ml-agents-unity.git",
     [string]$Branch = "crawler-sumo",
+    # Trainer config and env binary on the instance. Defaults are empty, which
+    # leaves launch_training.sh on its CrawlerSumoEGNN defaults, so existing
+    # sumo invocations are unaffected. For parkour pass:
+    #   -Branch crawler-parkour
+    #   -Config config/ppo/CrawlerParkour.yaml
+    #   -EnvBin envs/CrawlerParkour_Multi_linux/CrawlerParkour.x86_64
+    [string]$Config = "",
+    [string]$EnvBin = "",
     [string]$BuildTgz = "",
     [string]$InstanceName = "unity-rl-train",
     [switch]$Resume
@@ -112,7 +120,11 @@ Invoke-Ssh $ip "(umask 177 && echo '$ApiKey' > ~/.lambda_api_key)"
 
 # --- 8. Start training + watchdog ---
 $extra = if ($Resume) { "--resume" } else { "" }
-Invoke-Ssh $ip "bash ml-agents/scripts/lambda/launch_training.sh $RunId $NumEnvs $extra"
+# Paths are relative to the repo on the instance; expand them there.
+$envPrefix = ""
+if ($Config) { $envPrefix += "CONFIG=`$HOME/ml-agents/$Config " }
+if ($EnvBin) { $envPrefix += "ENV_BIN=`$HOME/ml-agents/$EnvBin " }
+Invoke-Ssh $ip "$envPrefix bash ml-agents/scripts/lambda/launch_training.sh $RunId $NumEnvs $extra"
 $limitMin = [int]([math]::Round($TimeLimitHours * 60))
 Invoke-Ssh $ip "tmux new-window -t train -n watchdog 'bash ~/ml-agents/scripts/lambda/watchdog.sh $instanceId $limitMin $GraceMinutes 2>&1 | tee -a ~/watchdog.log'"
 
