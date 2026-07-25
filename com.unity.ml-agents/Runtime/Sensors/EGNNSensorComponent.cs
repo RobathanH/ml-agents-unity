@@ -43,9 +43,24 @@ namespace Unity.MLAgents.Sensors
         [SerializeField]
         private int m_MaxEntities = 128;
 
-        // Cached category caps inferred from config at sensor creation time
+        // Frozen category plan. Built once in CreateSensors and never recomputed:
+        // the BufferSensor row width is allocated from these caps, so the pass that
+        // sizes a row and the pass that writes it must agree by construction.
+        // They previously did not. ComputeObservableSize counted statically
+        // configured non-empty SubType strings (including entries with Include=0),
+        // while Update counted labels discovered at runtime (falling back to
+        // GameObject names when SubType was blank) and then overwrote the caps.
+        // Both rules happened to yield 4 for CrawlerSumo -- {body, leg, foreleg,
+        // Sweatband} vs {body, leg, foreleg, Cylinder} -- so rows were the correct
+        // width by coincidence. Dropping the excluded Sweatband override, or naming
+        // the ground child's SubType, would have changed the written row length
+        // after the sensor had already been allocated.
         private int m_TypeCap = 1;
         private int m_SubTypeCap = 1;
+        private readonly Dictionary<string, int> m_TypeIndex = new Dictionary<string, int>();
+        private readonly Dictionary<string, int> m_SubTypeIndex = new Dictionary<string, int>();
+        private bool m_PlanBuilt;
+        private bool m_WarnedUnknownLabel;
 
         /// <summary>
         /// Whether to include per-entity orientation (quaternion) as attributes.
@@ -87,10 +102,9 @@ namespace Unity.MLAgents.Sensors
             if (m_IncludeRotation) size += 4;
             if (m_IncludeLinearVelocity) size += 3;
             if (m_IncludeAngularVelocity) size += 3;
-            // Ensure caps are initialized
-            if (m_TypeCap < 1 || m_SubTypeCap < 1)
+            if (!m_PlanBuilt)
             {
-                InferCategoryCaps(out m_TypeCap, out m_SubTypeCap);
+                BuildCategoryPlan();
             }
             size += Mathf.Max(1, m_TypeCap);
             size += Mathf.Max(1, m_SubTypeCap);
@@ -99,8 +113,8 @@ namespace Unity.MLAgents.Sensors
 
         public override ISensor[] CreateSensors()
         {
-            // Infer category sizes from current config and cache them
-            InferCategoryCaps(out m_TypeCap, out m_SubTypeCap);
+            // Freeze the label -> index maps and the resulting caps
+            BuildCategoryPlan();
             // Infer capacity from roots and included children
             m_MaxEntities = InferMaxEntities();
             int obsSize = ComputeObservableSize();
@@ -118,18 +132,6 @@ namespace Unity.MLAgents.Sensors
 
             // Gather transforms
             List<(Vector3 pos, Quaternion rot, Vector3 linVel, Vector3 angVel, int typeId, int subTypeId)> entities = new List<(Vector3, Quaternion, Vector3, Vector3, int, int)>();
-            var typeMap = new Dictionary<string, int>();
-            var subTypeMap = new Dictionary<string, int>();
-
-            Func<string, int, int> clampIndex = (label, max) =>
-            {
-                if (max <= 0)
-                {
-                    return 0;
-                }
-                int idx = 0;
-                return Mathf.Clamp(idx, 0, max - 1);
-            };
 
             foreach (var group in m_RootGroups)
             {
@@ -137,25 +139,15 @@ namespace Unity.MLAgents.Sensors
                 {
                     continue;
                 }
-                // Root-level type id
-                var typeLabel = group.Type ?? string.Empty;
-                if (!typeMap.ContainsKey(typeLabel))
-                {
-                    typeMap[typeLabel] = typeMap.Count;
-                }
-                int tidRaw = typeMap[typeLabel];
+                // Root-level type id (resolved against the frozen plan)
+                int tidRaw = LookupCategory(m_TypeIndex, TypeLabel(group), "type");
 
                 // Root entity
                 var rootRb = group.Root.GetComponent<Rigidbody>();
                 var rootCol = group.Root.GetComponent<Collider>();
                 if (rootRb != null || rootCol != null)
                 {
-                    var rootSubTypeLabel = string.IsNullOrEmpty(group.RootSubType) ? group.Root.name : group.RootSubType;
-                    if (!subTypeMap.ContainsKey(rootSubTypeLabel))
-                    {
-                        subTypeMap[rootSubTypeLabel] = subTypeMap.Count;
-                    }
-                    int sidRaw = subTypeMap[rootSubTypeLabel];
+                    int sidRaw = LookupCategory(m_SubTypeIndex, RootSubTypeLabel(group), "subtype");
                     if (rootRb != null)
                     {
                         entities.Add((rootRb.position, rootRb.rotation, rootRb.linearVelocity, rootRb.angularVelocity, tidRaw, sidRaw));
@@ -180,12 +172,7 @@ namespace Unity.MLAgents.Sensors
                         var childRb = child.Child.GetComponent<Rigidbody>();
                         var childCol = child.Child.GetComponent<Collider>();
                         if (childRb == null && childCol == null) continue;
-                        var subLabel = string.IsNullOrEmpty(child.SubType) ? child.Child.name : child.SubType;
-                        if (!subTypeMap.ContainsKey(subLabel))
-                        {
-                            subTypeMap[subLabel] = subTypeMap.Count;
-                        }
-                        int sidRaw2 = subTypeMap[subLabel];
+                        int sidRaw2 = LookupCategory(m_SubTypeIndex, ChildSubTypeLabel(child), "subtype");
                         if (childRb != null)
                         {
                             entities.Add((childRb.position, childRb.rotation, childRb.linearVelocity, childRb.angularVelocity, tidRaw, sidRaw2));
@@ -217,11 +204,9 @@ namespace Unity.MLAgents.Sensors
                 }
             }
 
-            // Write to buffer sensor as fixed-size rows; remaining rows stay zero as padding
-            // Determine final caps from discovered label maps
-            m_TypeCap = Mathf.Max(1, typeMap.Count);
-            m_SubTypeCap = Mathf.Max(1, subTypeMap.Count);
-
+            // Write to buffer sensor as fixed-size rows; remaining rows stay zero as
+            // padding. Caps are NOT recomputed here -- they are frozen in
+            // BuildCategoryPlan so the row width matches the allocated sensor.
             foreach (var e in entities)
             {
                 var row = BuildRow(e.pos, e.rot, e.linVel, e.angVel, e.typeId, e.subTypeId);
@@ -336,33 +321,111 @@ namespace Unity.MLAgents.Sensors
             return m_RootGroups[index];
         }
 
-        private void InferCategoryCaps(out int typeCap, out int subTypeCap)
+        // ---- Canonical label resolution -------------------------------------
+        // Update() and BuildCategoryPlan() MUST agree on both the label of an
+        // entity and on whether that entity is emitted at all. These helpers are
+        // the single source of truth for both passes.
+
+        private static string TypeLabel(RootGroup group)
         {
-            typeCap = 1;
-            subTypeCap = 1;
-            var types = new HashSet<string>();
-            var subtypes = new HashSet<string>();
-            foreach (var group in m_RootGroups)
+            return group.Type ?? string.Empty;
+        }
+
+        private static string RootSubTypeLabel(RootGroup group)
+        {
+            return string.IsNullOrEmpty(group.RootSubType) ? group.Root.name : group.RootSubType;
+        }
+
+        private static string ChildSubTypeLabel(ChildOverride child)
+        {
+            return string.IsNullOrEmpty(child.SubType) ? child.Child.name : child.SubType;
+        }
+
+        /// <summary>
+        /// Resolves a label against the frozen plan. Labels that appear only at
+        /// runtime (e.g. an object spawned into a group after CreateSensors) have
+        /// no reserved one-hot slot, so they fall back to index 0 rather than
+        /// widening the row past the allocated sensor.
+        /// </summary>
+        private int LookupCategory(Dictionary<string, int> index, string label, string kind)
+        {
+            int id;
+            if (index.TryGetValue(label, out id))
             {
-                if (group == null || group.Root == null) continue;
-                types.Add(group.Type ?? string.Empty);
-                if (!string.IsNullOrEmpty(group.RootSubType))
+                return id;
+            }
+            if (!m_WarnedUnknownLabel)
+            {
+                m_WarnedUnknownLabel = true;
+                Debug.LogWarning(
+                    $"[EGNNSensor:{m_SensorName}] Unknown {kind} label '{label}' encountered at runtime; " +
+                    "it has no reserved one-hot slot and will be reported as index 0. Declare every " +
+                    "label in the sensor's root groups before play so a slot is allocated for it.");
+            }
+            return 0;
+        }
+
+        /// <summary>
+        /// Freezes label -> one-hot index maps and the resulting caps. Enumerates
+        /// entities under exactly the same rules Update() uses, so the row width
+        /// computed here is the row width that gets written.
+        /// </summary>
+        private void BuildCategoryPlan()
+        {
+            m_TypeIndex.Clear();
+            m_SubTypeIndex.Clear();
+            if (m_RootGroups != null)
+            {
+                foreach (var group in m_RootGroups)
                 {
-                    subtypes.Add(group.RootSubType);
-                }
-                if (group.Children != null)
-                {
+                    if (group == null || group.Root == null)
+                    {
+                        continue;
+                    }
+                    var typeLabel = TypeLabel(group);
+                    if (!m_TypeIndex.ContainsKey(typeLabel))
+                    {
+                        m_TypeIndex[typeLabel] = m_TypeIndex.Count;
+                    }
+
+                    // Root contributes a subtype slot only if it is actually emitted
+                    if (group.Root.GetComponent<Rigidbody>() != null || group.Root.GetComponent<Collider>() != null)
+                    {
+                        var rootLabel = RootSubTypeLabel(group);
+                        if (!m_SubTypeIndex.ContainsKey(rootLabel))
+                        {
+                            m_SubTypeIndex[rootLabel] = m_SubTypeIndex.Count;
+                        }
+                    }
+
+                    if (!group.IncludeChildren)
+                    {
+                        continue;
+                    }
+                    SyncChildrenForGroup(group);
                     foreach (var child in group.Children)
                     {
-                        if (child != null && !string.IsNullOrEmpty(child.SubType))
+                        // Include=false entries are skipped by Update(), so they must
+                        // not reserve a slot here either.
+                        if (child == null || !child.Include || child.Child == null)
                         {
-                            subtypes.Add(child.SubType);
+                            continue;
+                        }
+                        if (child.Child.GetComponent<Rigidbody>() == null && child.Child.GetComponent<Collider>() == null)
+                        {
+                            continue;
+                        }
+                        var subLabel = ChildSubTypeLabel(child);
+                        if (!m_SubTypeIndex.ContainsKey(subLabel))
+                        {
+                            m_SubTypeIndex[subLabel] = m_SubTypeIndex.Count;
                         }
                     }
                 }
             }
-            typeCap = Mathf.Max(1, types.Count);
-            subTypeCap = Mathf.Max(1, subtypes.Count);
+            m_TypeCap = Mathf.Max(1, m_TypeIndex.Count);
+            m_SubTypeCap = Mathf.Max(1, m_SubTypeIndex.Count);
+            m_PlanBuilt = true;
         }
 
         private int InferMaxEntities()
