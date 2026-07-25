@@ -95,13 +95,21 @@ class EGNNLayer(nn.Module):
         return (diff * diff).sum(-1)
 
     @staticmethod
-    def _knn_indices(d2: torch.Tensor, k: int, eye: torch.Tensor) -> torch.Tensor:
+    def _knn_indices(
+        d2: torch.Tensor, k: int, eye: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         # d2: [B, N, N]; select k nearest neighbors using ONNX-friendly TopK
         # Use largest=True on negated distances to emulate ascending TopK.
         b, n, _ = d2.shape
         d2_neg = -d2
         # Strongly penalize self edges so they are never selected when taking largest
         d2_neg = d2_neg - eye.unsqueeze(0) * 1e9
+        if mask is not None:
+            # Padding rows are all-zero, so they sit at the origin of the sensor's
+            # virtual-root frame -- a perfectly plausible location. Without this
+            # they are selected as ordinary neighbours and act as phantom entities
+            # at the arena origin.
+            d2_neg = d2_neg - mask.unsqueeze(1) * 1e9
         k_eff = min(k, max(1, n - 1))
         _, idx = torch.topk(d2_neg, k=k_eff, dim=-1, largest=True)
         return idx  # [B, N, k]
@@ -124,7 +132,7 @@ class EGNNLayer(nn.Module):
         if eye is None or eye.shape[0] != n:
             eye = torch.eye(n, device=x.device, dtype=x.dtype)
         d2 = self._pairwise_squared_dist(x)
-        idx = self._knn_indices(d2, self.k, eye)
+        idx = self._knn_indices(d2, self.k, eye, mask)
         # Gather neighbors via a one-hot matmul (rows of an identity looked up by
         # neighbor index -> single-tensor Gather). Multi-tensor advanced indexing
         # and shape-derived arange+matmul both crash the TorchScript ONNX exporter,
@@ -176,13 +184,31 @@ class EGNNLayer(nn.Module):
         e_ij = torch.cat(edge_feats, dim=-1)
         m_ij = self.phi_e(e_ij)  # [B, N, K, M]
 
+        # Drop contributions from edges TopK was forced to invent. Penalising a
+        # candidate in _knn_indices only reorders it to the back; when a node has
+        # fewer than k valid neighbours something invalid is still returned, and
+        # both padding rows and the node itself carry the same -1e9 penalty, so
+        # either can be selected. A self-edge is invisible in the position update
+        # (zero displacement) but its message still reaches h, so masking has to
+        # cover both cases, and it has to happen after phi_x, whose bias makes
+        # phi_x(0) nonzero.
+        #
+        # This is a no-op whenever every node has at least k real neighbours,
+        # which is why fixed-population environments never saw it.
+        is_self = (onehot * eye.unsqueeze(0).unsqueeze(2)).sum(-1, keepdim=True)
+        valid_j = 1.0 - is_self  # [B, N, K, 1]
+        if mask is not None:
+            valid_j = valid_j * torch.matmul(
+                onehot, (1.0 - mask).unsqueeze(1).unsqueeze(-1)
+            )
+
         # Position update
         scale = self.phi_x(m_ij)  # [B, N, K, 1]
-        dx = d_vec * scale
+        dx = d_vec * scale * valid_j
         dx = dx.sum(dim=2) / max(1, self.k)
 
         # Feature update
-        m_sum = m_ij.sum(dim=2)
+        m_sum = (m_ij * valid_j).sum(dim=2)
         h_in = torch.cat([h, m_sum], dim=-1)
         dh = self.phi_h(h_in)
 
