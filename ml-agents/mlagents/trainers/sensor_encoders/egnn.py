@@ -268,6 +268,7 @@ class EGNNEncoder(nn.Module):
         has_quaternion: bool = False,
         has_linear_velocity: bool = False,
         has_angular_velocity: bool = False,
+        has_center_offset: bool = False,
         up_axis: Tuple[float, float, float] = (0.0, 1.0, 0.0),
     ):
         super().__init__()
@@ -292,7 +293,11 @@ class EGNNEncoder(nn.Module):
         edge_extra_dim = 0
         if self.attr_mode == "equivariant":
             self._build_layout(
-                input_dim, has_quaternion, has_linear_velocity, has_angular_velocity
+                input_dim,
+                has_quaternion,
+                has_linear_velocity,
+                has_angular_velocity,
+                has_center_offset,
             )
             self.register_buffer(
                 "up_vec", torch.tensor(list(up_axis), dtype=torch.float32).view(1, 1, 3)
@@ -330,11 +335,13 @@ class EGNNEncoder(nn.Module):
         has_quaternion: bool,
         has_linear_velocity: bool,
         has_angular_velocity: bool,
+        has_center_offset: bool,
     ) -> None:
         off = self.pos_dim
         self.quat_slice: Optional[Tuple[int, int]] = None
         self.linvel_slice: Optional[Tuple[int, int]] = None
         self.angvel_slice: Optional[Tuple[int, int]] = None
+        self.center_offset_slice: Optional[Tuple[int, int]] = None
         if has_quaternion:
             self.quat_slice = (off, off + 4)
             off += 4
@@ -344,19 +351,28 @@ class EGNNEncoder(nn.Module):
         if has_angular_velocity:
             self.angvel_slice = (off, off + 3)
             off += 3
+        if has_center_offset:
+            self.center_offset_slice = (off, off + 3)
+            off += 3
         if off > int(input_dim):
             raise ValueError(
                 f"EGNN entity layout consumes {off} columns but the sensor emits only "
                 f"{input_dim}. Check that has_quaternion/has_linear_velocity/"
-                f"has_angular_velocity match the Unity EGNNSensorComponent toggles."
+                f"has_angular_velocity/has_center_offset match the Unity "
+                f"EGNNSensorComponent toggles."
             )
+        # Everything after the last declared vector field is invariant. Half-extents
+        # land here: they are lengths along the entity's own axes, so they do not
+        # rotate with the scene and must not become a vector channel.
         self.scalar_slice = (off, int(input_dim))
         self.scalar_dim = int(input_dim) - off
-        # 3 axes per quaternion, 1 per velocity, plus the constant gravity channel
+        # 3 axes per quaternion, 1 per velocity, 1 for the centre offset, plus the
+        # constant gravity channel
         self.n_vec_channels = (
             (3 if has_quaternion else 0)
             + (1 if has_linear_velocity else 0)
             + (1 if has_angular_velocity else 0)
+            + (1 if has_center_offset else 0)
             + 1
         )
 
@@ -370,6 +386,9 @@ class EGNNEncoder(nn.Module):
             parts.append(f"linvel[{self.linvel_slice[0]}:{self.linvel_slice[1]}]")
         if self.angvel_slice is not None:
             parts.append(f"angvel[{self.angvel_slice[0]}:{self.angvel_slice[1]}]")
+        if self.center_offset_slice is not None:
+            lo, hi = self.center_offset_slice
+            parts.append(f"center_offset[{lo}:{hi}]")
         parts.append("up(const)")
         parts.append(f"scalars[{self.scalar_slice[0]}:{self.scalar_slice[1]}]")
         return (
@@ -394,6 +413,9 @@ class EGNNEncoder(nn.Module):
             chans.append(entities[..., lo:hi])
         if self.angvel_slice is not None:
             lo, hi = self.angvel_slice
+            chans.append(entities[..., lo:hi])
+        if self.center_offset_slice is not None:
+            lo, hi = self.center_offset_slice
             chans.append(entities[..., lo:hi])
         # Constant gravity reference, broadcast without an Expand node
         chans.append(entities[..., 0:3] * 0.0 + self.up_vec)

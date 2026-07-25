@@ -221,15 +221,24 @@ class EGNNSensorEncoderDefaults:
     pos_dim: int = 3
     embedding_size: int = 128
     # Entity-row layout. These MUST mirror the Unity EGNNSensorComponent's
-    # m_IncludeRotation / m_IncludeLinearVelocity / m_IncludeAngularVelocity
-    # toggles, because BuildRow writes the optional blocks in this fixed order:
-    #   pos(3) | quat(4)? | linear vel(3)? | angular vel(3)? | one-hots(rest)
+    # m_IncludeRotation / m_IncludeLinearVelocity / m_IncludeAngularVelocity /
+    # m_IncludeCenterOffset toggles, because BuildRow writes the optional blocks
+    # in this fixed order:
+    #   pos(3) | quat(4)? | linear vel(3)? | angular vel(3)? | centre offset(3)?
+    #   | extent(3)? | one-hots(rest)
     # A mismatch silently reinterprets geometry as one-hots, so the encoder
     # validates the declared layout against the sensor width and logs it.
+    # Note there is deliberately no has_extent: half-extents are lengths along the
+    # entity's own axes, so they are rotation-invariant and belong in the trailing
+    # scalar block alongside the one-hots, needing no dedicated slice.
     attr_mode: str = "equivariant"  # "equivariant" | "raw" (pre-fix behaviour)
     has_quaternion: bool = True
     has_linear_velocity: bool = True
     has_angular_velocity: bool = True
+    # Displacement from the emitted node position to the entity's centre. Sources
+    # that put the node on an obstacle's surface rather than at its centroid set
+    # this so the centre stays recoverable.
+    has_center_offset: bool = False
     # Vertical axis expressed in the sensor's virtual-root frame. Supplied to the
     # encoder as a constant equivariant channel so gravity-dependent quantities
     # (uprightness, height difference, vertical speed) remain representable
@@ -250,6 +259,7 @@ class EGNNSensorEncoderOverride:
     has_quaternion: Optional[bool] = None
     has_linear_velocity: Optional[bool] = None
     has_angular_velocity: Optional[bool] = None
+    has_center_offset: Optional[bool] = None
     up_axis: Optional[List[float]] = None
 
 

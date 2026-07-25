@@ -70,6 +70,7 @@ def build_egnn_registry(
             has_quaternion=bool(pick("has_quaternion")),
             has_linear_velocity=bool(pick("has_linear_velocity")),
             has_angular_velocity=bool(pick("has_angular_velocity")),
+            has_center_offset=bool(pick("has_center_offset")),
             up_axis=tuple(pick("up_axis")),
         )
         registry[name] = {
@@ -95,7 +96,8 @@ def build_egnn_registry(
                 f"[EGNN] Sensor '{name}' has only {egnn.scalar_dim} invariant column(s) left "
                 "after the declared geometry blocks. The sensor always emits a type and a "
                 "subtype one-hot, so expect at least 2 -- has_quaternion/has_linear_velocity/"
-                "has_angular_velocity probably over-declare what Unity is writing."
+                "has_angular_velocity/has_center_offset probably over-declare what Unity "
+                "is writing."
             )
     if not registry:
         logger.warning(

@@ -81,6 +81,25 @@ namespace Unity.MLAgents.Sensors
         private bool m_IncludeAngularVelocity = false;
 
         /// <summary>
+        /// Whether to include the displacement from the emitted node position to
+        /// the entity's centre. Only meaningful for sources that place the node
+        /// somewhere other than the centre (see <see cref="EGNNEntity"/>); it is
+        /// zero for hierarchy-derived entities. Emitted as an equivariant vector
+        /// channel, so the encoder's has_center_offset must match this.
+        /// </summary>
+        [SerializeField]
+        private bool m_IncludeCenterOffset = false;
+
+        /// <summary>
+        /// Whether to include per-entity half-extents. These are lengths along the
+        /// entity's own axes, hence rotation-invariant, and are consumed as plain
+        /// scalars. With position, rotation and centre offset they make a box's
+        /// encoding lossless.
+        /// </summary>
+        [SerializeField]
+        private bool m_IncludeExtent = false;
+
+        /// <summary>
         /// Optional virtual root to stabilize relative coordinates (model space reference).
         /// If set, positions and velocities are expressed in this frame.
         /// </summary>
@@ -93,7 +112,22 @@ namespace Unity.MLAgents.Sensors
         [SerializeField]
         private List<RootGroup> m_RootGroups = new List<RootGroup>();
 
+        /// <summary>
+        /// Components implementing <see cref="IEGNNEntitySource"/>, for entities
+        /// that cannot be discovered from a static hierarchy (procedurally
+        /// spawned obstacles and the like). Each source reserves its declared
+        /// entity budget and vocabulary in the frozen plan.
+        /// </summary>
+        [SerializeField]
+        private List<MonoBehaviour> m_EntitySources = new List<MonoBehaviour>();
+
         private BufferSensor m_Sensor;
+
+        // Reused across steps. Update() runs at frame rate for every agent, so
+        // allocating a row list per entity per frame was measurable GC churn even
+        // at CrawlerSumo's 19 entities; parkour buffers are several times larger.
+        private readonly List<EGNNEntity> m_Entities = new List<EGNNEntity>();
+        private float[] m_RowBuffer;
 
         // Per-entity feature size: 3 pos + optional attrs + one-hot(type) + one-hot(subtype)
         private int ComputeObservableSize()
@@ -102,6 +136,8 @@ namespace Unity.MLAgents.Sensors
             if (m_IncludeRotation) size += 4;
             if (m_IncludeLinearVelocity) size += 3;
             if (m_IncludeAngularVelocity) size += 3;
+            if (m_IncludeCenterOffset) size += 3;
+            if (m_IncludeExtent) size += 3;
             if (!m_PlanBuilt)
             {
                 BuildCategoryPlan();
@@ -115,9 +151,10 @@ namespace Unity.MLAgents.Sensors
         {
             // Freeze the label -> index maps and the resulting caps
             BuildCategoryPlan();
-            // Infer capacity from roots and included children
+            // Infer capacity from roots, included children and source budgets
             m_MaxEntities = InferMaxEntities();
             int obsSize = ComputeObservableSize();
+            m_RowBuffer = new float[obsSize];
             m_Sensor = new BufferSensor(m_MaxEntities, obsSize, m_SensorName);
             return new ISensor[] { m_Sensor };
         }
@@ -129,9 +166,7 @@ namespace Unity.MLAgents.Sensors
                 return;
             }
             m_Sensor.Reset();
-
-            // Gather transforms
-            List<(Vector3 pos, Quaternion rot, Vector3 linVel, Vector3 angVel, int typeId, int subTypeId)> entities = new List<(Vector3, Quaternion, Vector3, Vector3, int, int)>();
+            m_Entities.Clear();
 
             foreach (var group in m_RootGroups)
             {
@@ -148,24 +183,17 @@ namespace Unity.MLAgents.Sensors
                 if (rootRb != null || rootCol != null)
                 {
                     int sidRaw = LookupCategory(m_SubTypeIndex, RootSubTypeLabel(group), "subtype");
-                    if (rootRb != null)
-                    {
-                        entities.Add((rootRb.position, rootRb.rotation, rootRb.linearVelocity, rootRb.angularVelocity, tidRaw, sidRaw));
-                    }
-                    else
-                    {
-                        var tr = group.Root.transform;
-                        entities.Add((tr.position, tr.rotation, Vector3.zero, Vector3.zero, tidRaw, sidRaw));
-                    }
+                    AddHierarchyEntity(group.Root.transform, rootRb, rootCol, tidRaw, sidRaw);
                 }
 
-                if (entities.Count >= m_MaxEntities) break;
+                if (m_Entities.Count >= m_MaxEntities) break;
 
-                // Children selection
+                // Children selection. The override list is NOT re-synced here:
+                // BuildCategoryPlan already synced it, and the plan is frozen, so
+                // a child appearing afterwards has no reserved one-hot slot
+                // anyway. Re-syncing every frame only burned allocations.
                 if (group.IncludeChildren)
                 {
-                    // Ensure overrides are synchronized
-                    SyncChildrenForGroup(group);
                     foreach (var child in group.Children)
                     {
                         if (!child.Include || child.Child == null) continue;
@@ -173,19 +201,32 @@ namespace Unity.MLAgents.Sensors
                         var childCol = child.Child.GetComponent<Collider>();
                         if (childRb == null && childCol == null) continue;
                         int sidRaw2 = LookupCategory(m_SubTypeIndex, ChildSubTypeLabel(child), "subtype");
-                        if (childRb != null)
-                        {
-                            entities.Add((childRb.position, childRb.rotation, childRb.linearVelocity, childRb.angularVelocity, tidRaw, sidRaw2));
-                        }
-                        else
-                        {
-                            var trc = child.Child.transform;
-                            entities.Add((trc.position, trc.rotation, Vector3.zero, Vector3.zero, tidRaw, sidRaw2));
-                        }
-                        if (entities.Count >= m_MaxEntities) break;
+                        AddHierarchyEntity(child.Child, childRb, childCol, tidRaw, sidRaw2);
+                        if (m_Entities.Count >= m_MaxEntities) break;
                     }
                 }
-                if (entities.Count >= m_MaxEntities) break;
+                if (m_Entities.Count >= m_MaxEntities) break;
+            }
+
+            // Dynamic sources. Each is capped at the budget it declared, so the
+            // total can never exceed what CreateSensors allocated.
+            if (m_EntitySources != null)
+            {
+                foreach (var behaviour in m_EntitySources)
+                {
+                    var source = behaviour as IEGNNEntitySource;
+                    if (source == null) continue;
+                    int budget = Mathf.Min(source.MaxEntities, m_MaxEntities - m_Entities.Count);
+                    if (budget <= 0) break;
+                    int before = m_Entities.Count;
+                    source.CollectEntities(m_Entities, budget);
+                    // A source that overruns its budget would silently shift every
+                    // later entity's row, so truncate rather than trust it.
+                    if (m_Entities.Count - before > budget)
+                    {
+                        m_Entities.RemoveRange(before + budget, m_Entities.Count - before - budget);
+                    }
+                }
             }
 
             // Coordinate transform to virtual root if provided
@@ -193,57 +234,149 @@ namespace Unity.MLAgents.Sensors
             {
                 var invRot = Quaternion.Inverse(m_VirtualRoot.transform.rotation);
                 var origin = m_VirtualRoot.transform.position;
-                for (int i = 0; i < entities.Count; i++)
+                for (int i = 0; i < m_Entities.Count; i++)
                 {
-                    var e = entities[i];
-                    var relPos = invRot * (e.pos - origin);
-                    var relVel = invRot * e.linVel;
-                    var relAng = invRot * e.angVel;
-                    var relRot = invRot * e.rot;
-                    entities[i] = (relPos, relRot, relVel, relAng, e.typeId, e.subTypeId);
+                    var e = m_Entities[i];
+                    e.Position = invRot * (e.Position - origin);
+                    e.LinearVelocity = invRot * e.LinearVelocity;
+                    e.AngularVelocity = invRot * e.AngularVelocity;
+                    // A displacement, so it rotates but does not translate.
+                    e.CenterOffset = invRot * e.CenterOffset;
+                    e.Rotation = invRot * e.Rotation;
+                    // Extent is measured along the entity's own axes and is
+                    // therefore unaffected by a change of reference frame.
+                    m_Entities[i] = e;
                 }
             }
 
             // Write to buffer sensor as fixed-size rows; remaining rows stay zero as
             // padding. Caps are NOT recomputed here -- they are frozen in
             // BuildCategoryPlan so the row width matches the allocated sensor.
-            foreach (var e in entities)
+            for (int i = 0; i < m_Entities.Count; i++)
             {
-                var row = BuildRow(e.pos, e.rot, e.linVel, e.angVel, e.typeId, e.subTypeId);
-                m_Sensor.AppendObservation(row);
+                m_Sensor.AppendObservation(BuildRow(m_Entities[i]));
             }
         }
 
-        private float[] BuildRow(Vector3 pos, Quaternion rot, Vector3 linVel, Vector3 angVel, int typeId, int subTypeId)
+        private void AddHierarchyEntity(Transform tr, Rigidbody rb, Collider col, int typeId, int subTypeId)
         {
-            var obs = new List<float>(ComputeObservableSize());
+            var e = new EGNNEntity
+            {
+                Position = rb != null ? rb.position : tr.position,
+                Rotation = rb != null ? rb.rotation : tr.rotation,
+                LinearVelocity = rb != null ? rb.linearVelocity : Vector3.zero,
+                AngularVelocity = rb != null ? rb.angularVelocity : Vector3.zero,
+                // Hierarchy entities put their node at their own origin, so the
+                // centre offset is zero by construction.
+                CenterOffset = Vector3.zero,
+                Extent = m_IncludeExtent ? LocalHalfExtents(col) : Vector3.zero,
+                TypeId = typeId,
+                SubTypeId = subTypeId,
+            };
+            m_Entities.Add(e);
+        }
+
+        /// <summary>
+        /// Half-extents along the collider's own axes. Deliberately not
+        /// <c>Collider.bounds</c>, which is a world-space AABB and therefore
+        /// changes with orientation -- that would not be rotation-invariant and
+        /// could not be fed to the encoder as a scalar.
+        /// </summary>
+        internal static Vector3 LocalHalfExtents(Collider col)
+        {
+            if (col == null)
+            {
+                return Vector3.zero;
+            }
+            var s = col.transform.lossyScale;
+            var abs = new Vector3(Mathf.Abs(s.x), Mathf.Abs(s.y), Mathf.Abs(s.z));
+
+            var box = col as BoxCollider;
+            if (box != null)
+            {
+                return Vector3.Scale(box.size * 0.5f, abs);
+            }
+            var sphere = col as SphereCollider;
+            if (sphere != null)
+            {
+                // Unity scales a sphere collider by the largest axis scale.
+                float r = sphere.radius * Mathf.Max(abs.x, Mathf.Max(abs.y, abs.z));
+                return new Vector3(r, r, r);
+            }
+            var capsule = col as CapsuleCollider;
+            if (capsule != null)
+            {
+                // Radius follows the larger of the two off-axis scales; height
+                // follows the direction axis. Matches Unity's own convention.
+                float axisScale, radScale;
+                switch (capsule.direction)
+                {
+                    case 0: axisScale = abs.x; radScale = Mathf.Max(abs.y, abs.z); break;
+                    case 2: axisScale = abs.z; radScale = Mathf.Max(abs.x, abs.y); break;
+                    default: axisScale = abs.y; radScale = Mathf.Max(abs.x, abs.z); break;
+                }
+                float r = capsule.radius * radScale;
+                float half = Mathf.Max(capsule.height * 0.5f * axisScale, r);
+                switch (capsule.direction)
+                {
+                    case 0: return new Vector3(half, r, r);
+                    case 2: return new Vector3(r, r, half);
+                    default: return new Vector3(r, half, r);
+                }
+            }
+            var mesh = col as MeshCollider;
+            if (mesh != null && mesh.sharedMesh != null)
+            {
+                return Vector3.Scale(mesh.sharedMesh.bounds.extents, abs);
+            }
+            return Vector3.zero;
+        }
+
+        private float[] BuildRow(EGNNEntity e)
+        {
+            var obs = m_RowBuffer;
+            int n = 0;
             // Position first (for EGNN positional dims)
-            obs.Add(pos.x); obs.Add(pos.y); obs.Add(pos.z);
+            obs[n++] = e.Position.x; obs[n++] = e.Position.y; obs[n++] = e.Position.z;
             if (m_IncludeRotation)
             {
-                obs.Add(rot.x); obs.Add(rot.y); obs.Add(rot.z); obs.Add(rot.w);
+                obs[n++] = e.Rotation.x; obs[n++] = e.Rotation.y;
+                obs[n++] = e.Rotation.z; obs[n++] = e.Rotation.w;
             }
             if (m_IncludeLinearVelocity)
             {
-                obs.Add(linVel.x); obs.Add(linVel.y); obs.Add(linVel.z);
+                obs[n++] = e.LinearVelocity.x; obs[n++] = e.LinearVelocity.y; obs[n++] = e.LinearVelocity.z;
             }
             if (m_IncludeAngularVelocity)
             {
-                obs.Add(angVel.x); obs.Add(angVel.y); obs.Add(angVel.z);
+                obs[n++] = e.AngularVelocity.x; obs[n++] = e.AngularVelocity.y; obs[n++] = e.AngularVelocity.z;
+            }
+            // Equivariant vector channels must precede the scalar block: the
+            // encoder derives its scalar slice as "everything after the last
+            // declared vector field".
+            if (m_IncludeCenterOffset)
+            {
+                obs[n++] = e.CenterOffset.x; obs[n++] = e.CenterOffset.y; obs[n++] = e.CenterOffset.z;
+            }
+            if (m_IncludeExtent)
+            {
+                obs[n++] = e.Extent.x; obs[n++] = e.Extent.y; obs[n++] = e.Extent.z;
             }
             // Type one-hot (fixed size)
             int typeSize = Math.Max(1, m_TypeCap);
+            int tid = Mathf.Clamp(e.TypeId, 0, typeSize - 1);
             for (int i = 0; i < typeSize; i++)
             {
-                obs.Add(i == Mathf.Clamp(typeId, 0, typeSize - 1) ? 1f : 0f);
+                obs[n++] = i == tid ? 1f : 0f;
             }
             // SubType one-hot (fixed size)
             int subSize = Math.Max(1, m_SubTypeCap);
+            int sid = Mathf.Clamp(e.SubTypeId, 0, subSize - 1);
             for (int i = 0; i < subSize; i++)
             {
-                obs.Add(i == Mathf.Clamp(subTypeId, 0, subSize - 1) ? 1f : 0f);
+                obs[n++] = i == sid ? 1f : 0f;
             }
-            return obs.ToArray();
+            return obs;
         }
 
         internal void SyncChildrenForGroup(RootGroup group)
@@ -423,9 +556,65 @@ namespace Unity.MLAgents.Sensors
                     }
                 }
             }
+
+            // Dynamic sources reserve their whole declared vocabulary, whether or
+            // not they happen to emit it this episode. Their membership changes
+            // between episodes, so anything resolved lazily would give the same
+            // label a different one-hot slot from one reset to the next.
+            if (m_EntitySources != null)
+            {
+                foreach (var behaviour in m_EntitySources)
+                {
+                    var source = behaviour as IEGNNEntitySource;
+                    if (source == null)
+                    {
+                        if (behaviour != null)
+                        {
+                            Debug.LogWarning(
+                                $"[EGNNSensor:{m_SensorName}] Entity source '{behaviour.name}' " +
+                                $"({behaviour.GetType().Name}) does not implement IEGNNEntitySource " +
+                                "and will be ignored.");
+                        }
+                        continue;
+                    }
+                    var typeLabel = source.TypeLabel ?? string.Empty;
+                    if (!m_TypeIndex.ContainsKey(typeLabel))
+                    {
+                        m_TypeIndex[typeLabel] = m_TypeIndex.Count;
+                    }
+                    var subLabels = source.SubTypeLabels ?? Array.Empty<string>();
+                    foreach (var label in subLabels)
+                    {
+                        var key = label ?? string.Empty;
+                        if (!m_SubTypeIndex.ContainsKey(key))
+                        {
+                            m_SubTypeIndex[key] = m_SubTypeIndex.Count;
+                        }
+                    }
+                }
+            }
+
             m_TypeCap = Mathf.Max(1, m_TypeIndex.Count);
             m_SubTypeCap = Mathf.Max(1, m_SubTypeIndex.Count);
             m_PlanBuilt = true;
+
+            // Hand each source its resolved indices now that the plan is final, so
+            // it can emit them directly instead of hashing strings every step.
+            if (m_EntitySources != null)
+            {
+                foreach (var behaviour in m_EntitySources)
+                {
+                    var source = behaviour as IEGNNEntitySource;
+                    if (source == null) continue;
+                    var subLabels = source.SubTypeLabels ?? Array.Empty<string>();
+                    var resolved = new int[subLabels.Length];
+                    for (int i = 0; i < subLabels.Length; i++)
+                    {
+                        resolved[i] = m_SubTypeIndex[subLabels[i] ?? string.Empty];
+                    }
+                    source.BindCategoryIndices(m_TypeIndex[source.TypeLabel ?? string.Empty], resolved);
+                }
+            }
         }
 
         private int InferMaxEntities()
@@ -461,6 +650,17 @@ namespace Unity.MLAgents.Sensors
                         {
                             count++;
                         }
+                    }
+                }
+            }
+            if (m_EntitySources != null)
+            {
+                foreach (var behaviour in m_EntitySources)
+                {
+                    var source = behaviour as IEGNNEntitySource;
+                    if (source != null)
+                    {
+                        count += Mathf.Max(0, source.MaxEntities);
                     }
                 }
             }
