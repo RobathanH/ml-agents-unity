@@ -12,7 +12,12 @@ import sys
 
 from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
 
-STAGING = r"D:\UnityRL\ml-agents\results\cloud_staging"
+# Resolved from this file, not hardcoded: with one worktree per project each
+# has its own staging root, and an absolute path would read the wrong one.
+# Override with UNITYRL_STAGING.
+STAGING = os.environ.get("UNITYRL_STAGING") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "results", "cloud_staging")
 KEY_TAGS = [
     "Self-play/ELO",
     "Policy/Entropy",
@@ -21,7 +26,7 @@ KEY_TAGS = [
     "CrawlerSumoLearner/WinReward",
     "CrawlerSumoOpponent/WinReward",
     "CrawlerSumo/FlipKnockdownEnd",  # run 011+: proportion of matches decided by flip
-    # Run 014+: the primary decisiveness signal. ELO no longer carries it —
+    # Run 014+: the primary decisiveness signal. ELO no longer carries it --
     # timeouts are flagged interrupted, and ghost/trainer.py skips ELO
     # accounting for interrupted trajectories, so ELO now scores decisive games
     # only. Read DrawRate first, ELO second.

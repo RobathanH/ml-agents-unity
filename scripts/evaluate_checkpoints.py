@@ -27,10 +27,14 @@ import sys
 import tempfile
 import time
 
-STAGING = r"D:\UnityRL\ml-agents\results\cloud_staging"
-EVAL_EXE = r"D:\UnityRL\ml-agents\envs\CrawlerSumoEGNN_Multi_win\UnityEnvironment.exe"
+# Repo-relative, not absolute: with one worktree per project each has its own
+# staging root, builds and Unity project, and absolute paths would silently
+# read another project's data. Unity itself is machine-wide.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STAGING = os.environ.get("UNITYRL_STAGING") or os.path.join(REPO, "results", "cloud_staging")
+EVAL_EXE = os.path.join(REPO, "envs", "CrawlerSumoEGNN_Multi_win", "UnityEnvironment.exe")
 UNITY_EXE = r"C:\Program Files\Unity\Hub\Editor\6000.0.40f1\Editor\Unity.exe"
-PROJECT = r"D:\UnityRL\ml-agents\Project"
+PROJECT = os.path.join(REPO, "Project")
 
 
 def step_of(path):

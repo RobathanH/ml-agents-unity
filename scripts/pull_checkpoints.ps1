@@ -41,10 +41,11 @@ foreach ($f in $remoteFiles) {
 }
 
 if ($CopyLatestToUnity -and $newest) {
-    $unityModels = Join-Path $PSScriptRoot "..\Project\Assets\CrawlerSumo\Models"
+    # Model folder follows the behavior name, so this works for any project.
+    $unityModels = Join-Path $PSScriptRoot "..\Project\Assets\$BehaviorName\Models"
     New-Item -ItemType Directory -Force $unityModels | Out-Null
     Copy-Item $newest (Join-Path $unityModels "$RunId-latest.onnx") -Force
-    Write-Host "Copied newest checkpoint to Project\Assets\CrawlerSumo\Models\$RunId-latest.onnx"
+    Write-Host "Copied newest checkpoint to Project\Assets\$BehaviorName\Models\$RunId-latest.onnx"
 }
 
 Write-Host "`n== Training progress (last console lines with step counts) =="

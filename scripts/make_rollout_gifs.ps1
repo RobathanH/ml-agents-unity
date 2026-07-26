@@ -11,20 +11,27 @@ Pipeline per matchup:
 .\scripts\make_rollout_gifs.ps1                     # newest run in staging
 .\scripts\make_rollout_gifs.ps1 -RunId CrawlerSumoEGNN_006 -CaptureSeconds 30
 #>
+# Paths default to THIS worktree (see $PSScriptRoot resolution below), not an
+# absolute repo: with one worktree per project, an absolute path would read
+# another project's staging and builds. Unity itself is machine-wide.
 param(
     [string]$RunId = "",
-    [string]$StagingRoot = "D:\UnityRL\ml-agents\results\cloud_staging",
+    [string]$StagingRoot = "",
     [string]$BehaviorName = "CrawlerSumo",
     [int]$CaptureSeconds = 25,
     [int]$CaptureFps = 10,
     [string]$UnityExe = "C:\Program Files\Unity\Hub\Editor\6000.0.40f1\Editor\Unity.exe",
-    [string]$ViewerExe = "D:\UnityRL\ml-agents\envs\CrawlerSumoEGNN_viewer_win\CrawlerSumoViewer.exe",
-    [string]$ProjectPath = "D:\UnityRL\ml-agents\Project",
+    [string]$ViewerExe = "",
+    [string]$ProjectPath = "",
     # name=value overrides forwarded to the viewer as --env-param (match the
     # run's training physics, e.g. "joint_strength_multiplier_min=1.5")
     [string[]]$EnvParams = @()
 )
 $ErrorActionPreference = "Continue"
+$repo = Join-Path $PSScriptRoot ".."
+if (-not $StagingRoot) { $StagingRoot = Join-Path $repo "results\cloud_staging" }
+if (-not $ProjectPath) { $ProjectPath = Join-Path $repo "Project" }
+if (-not $ViewerExe) { $ViewerExe = Join-Path $repo "envs\CrawlerSumoEGNN_viewer_win\CrawlerSumoViewer.exe" }
 $LogFile = Join-Path $StagingRoot "gif.log"
 function Log([string]$msg) {
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg"
