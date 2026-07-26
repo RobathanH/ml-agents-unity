@@ -21,6 +21,12 @@ KEY_TAGS = [
     "CrawlerSumoLearner/WinReward",
     "CrawlerSumoOpponent/WinReward",
     "CrawlerSumo/FlipKnockdownEnd",  # run 011+: proportion of matches decided by flip
+    # Run 014+: the primary decisiveness signal. ELO no longer carries it —
+    # timeouts are flagged interrupted, and ghost/trainer.py skips ELO
+    # accounting for interrupted trajectories, so ELO now scores decisive games
+    # only. Read DrawRate first, ELO second.
+    "CrawlerSumo/DrawRate",
+    "CrawlerSumo/TimeoutRate",
     "Losses/Value Loss",
 ]
 

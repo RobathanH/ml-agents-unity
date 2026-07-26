@@ -375,7 +375,9 @@ public class CrawlerSumoEnvController : MonoBehaviour
         // Max steps termination
         if (maxEpisodeSteps > 0 && m_StepCount >= maxEpisodeSteps)
         {
-            EndBothEpisodes(0f, 0f); // Draw - no terminal rewards
+            // Draw, no terminal rewards -- and flagged as a TRUNCATION, not a
+            // terminal state. See EndBothEpisodesWithWinInfo.
+            EndBothEpisodesWithWinInfo(0f, 0f, interrupted: true);
             ResetSumo();
         }
     }
@@ -587,12 +589,46 @@ public class CrawlerSumoEnvController : MonoBehaviour
     /// </summary>
     public static event System.Action<CrawlerSumoEnvController, float> MatchEnded;
 
-    private void EndBothEpisodesWithWinInfo(float c1TerminalReward, float c2TerminalReward)
+    /// <summary>
+    /// Ends the match. <paramref name="interrupted"/> distinguishes the two
+    /// kinds of ending, which look identical to the environment but not to the
+    /// trainer.
+    ///
+    /// A ring-out is a real terminal: nothing follows it, so a value target of
+    /// 0 is correct. Hitting maxEpisodeSteps is a TRUNCATION -- the fight was
+    /// still going and we cut it off -- so Agent.EpisodeInterrupted is the
+    /// right call. It sets DoneReason.MaxStepReached, which makes the trainer
+    /// bootstrap V(s_T) instead of forcing 0 (ppo/trainer.py L98 passes
+    /// `done_reached and not interrupted` into the value estimate).
+    /// EndEpisode here would train the critic to predict 0 at a step the agent
+    /// cannot identify -- there is no clock in the observation -- which is the
+    /// same unobservable-mechanic bug as the shrinking ring, just on the value
+    /// target instead of the termination boundary.
+    ///
+    /// KNOWN SIDE EFFECT: ghost/trainer.py L201-205 skips ELO accounting for
+    /// interrupted trajectories, so from run 014 on, Self-play/ELO is computed
+    /// from DECISIVE games only and draws no longer damp it toward the
+    /// opponent's rating. ELO numbers are therefore NOT comparable with runs
+    /// 006-013, and a draw-camping meta would no longer show up as a flat ELO
+    /// (it did not reliably show up before either -- run 008 climbed 1201->1634
+    /// while drawing 98% of tournament games). The DrawRate/TimeoutRate stats
+    /// below exist to monitor that directly instead of inferring it from ELO.
+    /// </summary>
+    private void EndBothEpisodesWithWinInfo(
+        float c1TerminalReward, float c2TerminalReward, bool interrupted = false)
     {
-        if (m_Recorder != null && flipKnockdownSteps > 0)
+        if (m_Recorder != null)
         {
-            // Proportion of matches decided by flip knockdown (vs ring-out/timeout)
-            m_Recorder.Add("CrawlerSumo/FlipKnockdownEnd", m_LastEndWasFlip ? 1f : 0f);
+            if (flipKnockdownSteps > 0)
+            {
+                // Proportion of matches decided by flip knockdown (vs ring-out/timeout)
+                m_Recorder.Add("CrawlerSumo/FlipKnockdownEnd", m_LastEndWasFlip ? 1f : 0f);
+            }
+            // Match outcome mix. DrawRate counts both timeouts and the rare
+            // both-fell-together case; TimeoutRate isolates the cap. Match
+            // properties, not agent properties, so they are recorded unsplit.
+            m_Recorder.Add("CrawlerSumo/DrawRate", c1TerminalReward == 0f ? 1f : 0f);
+            m_Recorder.Add("CrawlerSumo/TimeoutRate", interrupted ? 1f : 0f);
         }
         m_LastEndWasFlip = false;
         MatchEnded?.Invoke(this, c1TerminalReward);
@@ -617,13 +653,16 @@ public class CrawlerSumoEnvController : MonoBehaviour
         RecordStatForLearningAgent("LossPenalty", c1LossPenalty, crawler1);
         RecordStatForLearningAgent("LossPenalty", c2LossPenalty, crawler2);
         
-        crawler1.EndEpisode();
-        crawler2.EndEpisode();
-    }
-    
-    private void EndBothEpisodes(float c1TerminalReward, float c2TerminalReward)
-    {
-        EndBothEpisodesWithWinInfo(c1TerminalReward, c2TerminalReward);
+        if (interrupted)
+        {
+            crawler1.EpisodeInterrupted();
+            crawler2.EpisodeInterrupted();
+        }
+        else
+        {
+            crawler1.EndEpisode();
+            crawler2.EndEpisode();
+        }
     }
 
     /// <summary>
