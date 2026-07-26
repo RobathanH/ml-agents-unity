@@ -176,26 +176,41 @@ foreach ($inst in $instances) {
 
     # No parens/pipes in the remote command: Windows ssh + PowerShell mangle the
     # quoting. List everything, filter by extension client-side.
-    $listing = ssh -i $KeyFile -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes "ubuntu@$ip" "find /home/ubuntu/ml-agents/results -maxdepth 3 -type f -printf '%s %p\n' 2>/dev/null"
+    # mtime as well as size, because size alone CANNOT see the file that matters
+    # most. checkpoint.pt is rewritten in place every save and is byte-identical
+    # in length every time (fixed architecture), so a size comparison declares it
+    # unchanged forever and the staging copy silently stays at whatever the first
+    # sync of the run happened to catch. Found this holding run 004's 11:50 copy
+    # while the instance had the 19:41 final -- and checkpoint.pt is precisely
+    # the file --resume and --initialize-from read.
+    $listing = ssh -i $KeyFile -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes "ubuntu@$ip" "find /home/ubuntu/ml-agents/results -maxdepth 3 -type f -printf '%s %T@ %p\n' 2>/dev/null"
     if ($LASTEXITCODE -ne 0 -or -not $listing) { Log "WARN: could not list files on $ip"; continue }
 
+    $epoch = [datetime]"1970-01-01T00:00:00Z"
     $wanted = "\.onnx$|\.pt$|\.yaml$|\.json$|\.log$|/events\.out\."
     $pulled = 0
     foreach ($line in $listing) {
-        $parts = "$line".Split(" ", 2)
-        if ($parts.Count -ne 2) { continue }
+        $parts = "$line".Split(" ", 3)
+        if ($parts.Count -ne 3) { continue }
         $size = [long]$parts[0]
-        $remote = $parts[1]
+        $remoteMtime = $epoch.AddSeconds([double]$parts[1]).ToLocalTime()
+        $remote = $parts[2]
         if ($remote -notmatch $wanted) { continue }
         $rel = $remote -replace "^/home/ubuntu/ml-agents/results/", "" -replace "/", "\"
         $local = Join-Path $dest $rel
         $need = $true
         if (Test-Path $local) {
-            if ((Get-Item $local).Length -eq $size) { $need = $false }
+            $li = Get-Item $local
+            # scp -p below stamps the local copy with the REMOTE mtime, so this
+            # compares like with like. Files pulled by an older revision of this
+            # script carry their download time instead, which is later than the
+            # remote mtime -- so they read as current and are not re-fetched.
+            # 2s of slack absorbs filesystem timestamp granularity.
+            if ($li.Length -eq $size -and $li.LastWriteTime -ge $remoteMtime.AddSeconds(-2)) { $need = $false }
         }
         if ($need) {
             New-Item -ItemType Directory -Force (Split-Path $local) | Out-Null
-            scp -q -i $KeyFile -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes "ubuntu@${ip}:$remote" $local 2>$null
+            scp -q -p -i $KeyFile -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes "ubuntu@${ip}:$remote" $local 2>$null
             if ($LASTEXITCODE -eq 0) { $pulled++ } else { Log "WARN: scp failed for $remote" }
         }
     }
