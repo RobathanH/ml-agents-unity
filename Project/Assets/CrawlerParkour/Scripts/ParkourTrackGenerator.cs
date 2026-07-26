@@ -105,6 +105,12 @@ namespace CrawlerParkour
         public float FloorThickness = 2f;
         [Tooltip("Flat run-in before the first patterned segment.")]
         public int LeadInSegments = 2;
+        [Tooltip("Solid ground behind segment 0, so the crawler is not spawned "
+            + "with its hindquarters over the edge.")]
+        public float StartApron = 4f;
+        [Tooltip("Solid ground past the last segment, so the finish line can be "
+            + "approached with all four feet on the ground.")]
+        public float FinishApron = 4f;
 
         [Header("Prefabs")]
         public GameObject BoxPrefab;
@@ -220,6 +226,26 @@ namespace CrawlerParkour
             float lane = 0f;
             var prevPattern = SegmentPattern.Flat;
 
+            // Aprons: solid ground outside the scored track, at both ends.
+            //
+            // The crawler is ~3.9m long, but every placement in this project is a
+            // single point at the body centre -- the controller spawns at z=1 and a
+            // checkpoint respawn lands at z=0.5, both measured centre-to-floor. With
+            // the floor starting at z=0 that put 25% of the animal over the void at
+            // spawn and 38% after every fall, hind legs first, so its opening move
+            // was always a scramble not to fall off backwards. That is a start
+            // condition, not a skill, and it was being trained on every episode.
+            //
+            // Deliberately NOT part of TrackLength: that is the denominator of
+            // ProgressFraction and the finish threshold, so folding the aprons into
+            // it would silently rescale every curriculum threshold and make run 004
+            // incomparable with 002 and 003. The apron is ground to stand on, not
+            // track to cover.
+            if (StartApron > 0f)
+            {
+                AddFloor(-StartApron * 0.5f, 0f, StartApron, m_Diff.TrackWidth, y);
+            }
+
             for (int i = 0; i < SegmentCount; i++)
             {
                 var pattern = i < LeadInSegments ? SegmentPattern.Flat : PickPattern();
@@ -239,10 +265,20 @@ namespace CrawlerParkour
                 float laneHalf = m_Diff.MinCorridor * 0.5f;
                 float laneMin = -halfW + laneHalf;
                 float laneMax = halfW - laneHalf;
-                if (laneMin > laneMax)
+                if (i == 0 || laneMin > laneMax)
                 {
-                    // Track narrower than the corridor requirement: the whole width
-                    // is the lane.
+                    // Segment 0's lane is fixed at the centre line, because both
+                    // the spawn and the first checkpoint respawn sit on it. Drifted,
+                    // it threw the crawler off the SIDE the way the missing apron
+                    // threw it off the back: the track narrows to 5m at d=1 against
+                    // a 3.94m splayed rest pose, so any lane offset over 0.53m hangs
+                    // part of the animal over the void before it has acted once.
+                    // Centred, it fits at every difficulty. Segments 1+ still drift,
+                    // so the track itself is as varied as it ever was -- only the
+                    // start is deterministic.
+                    //
+                    // (The second case is unrelated: a track narrower than the
+                    // corridor requirement has no lateral freedom to give.)
                     lane = 0f;
                 }
                 else
@@ -284,6 +320,18 @@ namespace CrawlerParkour
                 m_LaneCenter.Add(lane);
                 prevPattern = pattern;
                 y = nextY;
+            }
+
+            // The same defect sits at the far end, and it bears directly on the
+            // stat that matters: Finished is triggered at TrackLength - 1, so the
+            // crawler has to reach z=127 on a floor ending at z=128 -- its front
+            // feet are over the void for the whole final approach. `y` here is the
+            // height the last segment ended at, so the apron continues that surface
+            // rather than reintroducing a step at the line.
+            if (FinishApron > 0f)
+            {
+                AddFloor(TrackLength + FinishApron * 0.5f, 0f, FinishApron,
+                    m_Diff.TrackWidth, y);
             }
         }
 

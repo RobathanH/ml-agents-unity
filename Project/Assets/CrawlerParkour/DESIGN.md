@@ -128,6 +128,39 @@ the agent into a void. Without this, every "squeeze under" reduces to "walk
 around", and the whole vocabulary collapses to one question. With it, the
 generator can *force* an interaction by spanning the free width.
 
+**The two ends are aprons, not edges.** `StartApron` and `FinishApron` (4 m each)
+extend solid full-width ground behind segment 0 and past the last segment. They
+are not part of `TrackLength`, so they change neither `ProgressFraction` nor the
+finish threshold — they are ground to stand on, not track to cover.
+
+They exist because the edges above are deliberate and the ends were not. The
+crawler is ~3.9 m long but every placement in this project is a single point at
+the body centre: the controller spawned it at `z = 1` and a checkpoint respawn
+lands at `z = 0.5`, against a floor that began at `z = 0`. That put **25% of the
+animal over the void at spawn and 38% after every fall**, hind legs first, so its
+opening move was always a scramble not to fall off backwards — a start condition
+being trained as if it were a skill. The same defect sat at the far end, where
+`Finished` triggers at `TrackLength − 1` and the final metre had to be walked
+with the front feet over nothing.
+
+**Segment 0's lane is not randomised.** Lane centres drift laterally per segment
+(§3.2), and the spawn and first checkpoint respawn both sit on segment 0's. A
+drifted start lane threw the crawler off the *side* exactly as the missing apron
+threw it off the *back*: at d = 1 the track is 5 m wide against a 3.94 m splayed
+rest pose, so any lane offset over 0.53 m leaves part of the animal over the void
+before it has taken an action. Segment 0 is therefore pinned to the centre line,
+where the crawler fits at every difficulty; segments 1+ drift as before, so track
+variety is unchanged and only the start is deterministic.
+
+Both defects survived into runs 001–003 because the build check tested
+`GroundHeightAt` at the body centre, which was a comfortable metre clear of the
+edge the whole time. A point test cannot see a footprint. The check now
+rasterises the crawler's actual collider bounds at spawn, first respawn and the
+finish line, across d ∈ {0, 0.25, 1}, and separates ground missing *in Z* (never
+intended: the world ran out) from footprint *past the lateral edge* (intended
+mid-track at high difficulty, where the narrow track is the challenge). Only the
+first fails the build.
+
 ### 3.2 Feasibility invariant (the part that must not be hand-waved)
 
 "Difficult but possible" is only real if it is **checked**, not hoped for. The

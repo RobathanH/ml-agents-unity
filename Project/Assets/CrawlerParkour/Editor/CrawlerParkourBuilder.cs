@@ -270,6 +270,13 @@ public static class CrawlerParkourBuilder
             generator.BoxParent = boxes.transform;
             generator.FloorMaterial = floorMat;
             generator.ObstacleMaterial = obstacleMat;
+            // Set explicitly rather than left to the field initialiser, so the
+            // value is visible in the prefab YAML instead of depending on what
+            // Unity does with a field the serialised data predates. 4m against a
+            // deepest start footprint edge of z=-1.47 (the first checkpoint
+            // respawn) leaves ~2.5m to stagger backwards into.
+            generator.StartApron = 4f;
+            generator.FinishApron = 4f;
 
             var source = track.AddComponent<ParkourObstacleSource>();
             source.Track = generator;
@@ -669,10 +676,6 @@ public static class CrawlerParkourBuilder
                         Vector3.Distance(box.Tr.position, origin + box.Center));
                 }
 
-                // The spawn column has to be solid ground, in track space.
-                var lane = track.LaneCenterAt(1f);
-                var grounded = track.GroundHeightAt(lane, 1f, out var top);
-
                 // And the sensor has to see those boxes from where the crawler is,
                 // in world space -- this is the conversion back out of track space.
                 controller.obstacleSource.Reference = controller.agent.body;
@@ -685,17 +688,11 @@ public static class CrawlerParkourBuilder
                 Debug.Log(
                     $"arena {index}: origin {origin}, {boxes.Count} boxes, "
                     + $"worst placement error {worstPlacement:F4}m, "
-                    + $"ground at spawn {(grounded ? top.ToString("F2") : "NONE")}, "
                     + $"{entities.Count} sensed, nearest {nearest:F2}m");
 
                 if (worstPlacement > 1e-3f)
                 {
                     Debug.LogError($"arena {index}: boxes are not where the maths says");
-                    ok = false;
-                }
-                if (!grounded)
-                {
-                    Debug.LogError($"arena {index}: no ground under the spawn point");
                     ok = false;
                 }
                 if (entities.Count == 0 || float.IsNaN(nearest) || nearest > 25f)
@@ -704,6 +701,48 @@ public static class CrawlerParkourBuilder
                         $"arena {index}: obstacle nodes are not near the crawler "
                         + "-- the track-to-world conversion is wrong");
                     ok = false;
+                }
+
+                // Every place an episode can START has to be solid ground under the
+                // whole animal, not just under its navel.
+                //
+                // This was one GroundHeightAt at the body centre, and it passed
+                // while 25% of the crawler hung over the back edge at every spawn
+                // and 38% after every fall -- the crawler is ~3.9m long and its
+                // centre was always a metre clear of the edge. Measure what the body
+                // occupies, not where it is.
+                //
+                // Only ground missing in Z is a defect. Lateral overhang at high
+                // difficulty is the environment working as designed: the track
+                // narrows to 5m and the corridor to 1.7m against a 3.94m splayed
+                // rest pose, so the crawler is MEANT to have to tuck. Running out of
+                // world in Z is never intended, so the two are counted separately
+                // and only the first fails the build.
+                foreach (var d in new[] { 0f, 0.25f, 1f })
+                {
+                    track.Generate(12345, d);
+                    var finishZ = track.TrackLength - 1f;
+                    var cases = new[]
+                    {
+                        ("spawn", new Vector2(track.LaneCenterAt(1f), 1f)),
+                        ("respawn", new Vector2(track.LaneCenterAt(0f), 0.5f)),
+                        ("finish", new Vector2(track.LaneCenterAt(finishZ), finishZ)),
+                    };
+                    foreach (var (name, centre) in cases)
+                    {
+                        var (overVoid, overSide) = Footprint(track, controller.agent, centre);
+                        Debug.Log(
+                            $"arena {index} d={d:F2} {name}: {overVoid * 100f:F0}% of the "
+                            + $"footprint over a void, {overSide * 100f:F0}% past the track edge");
+                        if (overVoid > 1e-3f)
+                        {
+                            Debug.LogError(
+                                $"arena {index} d={d:F2}: the crawler {name}s over the end of "
+                                + $"the world -- {overVoid * 100f:F0}% of its footprint has no "
+                                + "ground under it. Extend StartApron/FinishApron.");
+                            ok = false;
+                        }
+                    }
                 }
             }
             Debug.Log(ok ? "VERIFY OK" : "VERIFY FAILED");
@@ -714,6 +753,55 @@ public static class CrawlerParkourBuilder
             ok = false;
         }
         ExitIfBatch(ok);
+    }
+
+    /// <summary>
+    /// Rasterises the crawler's footprint with its body centre at a track-space
+    /// (x, z), and splits what is unsupported into two causes: over a void inside
+    /// the track's own width, and past the track edge entirely.
+    /// </summary>
+    /// <remarks>
+    /// The split is the whole point. Lateral overhang is a design property at high
+    /// difficulty -- the track narrows below the splayed rest pose on purpose --
+    /// while a void in Z means the track simply ran out, which is never intended.
+    /// A single "unsupported" number conflates the two and either fails on correct
+    /// geometry or passes on a crawler spawned off the end.
+    ///
+    /// Measures the authored rest pose, which is exactly what an episode starts
+    /// from: OnEpisodeBegin calls BodyPart.Reset to restore the recorded world
+    /// transforms, then TeleportTo translates the whole animal rigidly to the spawn
+    /// point. So the footprint at spawn is the prefab's own footprint, offset.
+    /// </remarks>
+    static (float overVoid, float overSide) Footprint(
+        ParkourTrackGenerator track, CrawlerParkourAgent agent, Vector2 centre)
+    {
+        var cols = agent.GetComponentsInChildren<Collider>();
+        if (cols.Length == 0) return (0f, 0f);
+        var b = cols[0].bounds;
+        foreach (var c in cols) b.Encapsulate(c.bounds);
+
+        // Relative to the body centre, since that is what the spawn point sets.
+        // Not assumed symmetric -- the offset is measured, not halved.
+        var lo = b.min - agent.body.position;
+        var hi = b.max - agent.body.position;
+        var halfW = track.TrackWidth * 0.5f;
+
+        const float step = 0.1f;
+        var voids = 0;
+        var sides = 0;
+        var total = 0;
+        for (var dx = lo.x; dx <= hi.x + 1e-4f; dx += step)
+        {
+            for (var dz = lo.z; dz <= hi.z + 1e-4f; dz += step)
+            {
+                total++;
+                var x = centre.x + dx;
+                if (Mathf.Abs(x) > halfW) { sides++; }
+                else if (!track.GroundHeightAt(x, centre.y + dz, out _)) { voids++; }
+            }
+        }
+        if (total == 0) return (0f, 0f);
+        return (voids / (float)total, sides / (float)total);
     }
 
     static bool BuildPlayer(string scenePath, string outDirName, string exeName, BuildTarget target)
