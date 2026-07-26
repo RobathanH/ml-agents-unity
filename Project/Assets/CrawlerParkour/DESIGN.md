@@ -324,6 +324,38 @@ does the policy that does **nothing** score — and is there a smooth path of
 improving reward between them? The dense velocity term is what supplies that
 path.
 
+### 5.1 Episode length is a reward parameter, not a budget knob
+
+`max_episode_steps` looks like a scheduling detail. It is not: **it rescales
+four of the five reward terms, each by a different factor.** Changing it without
+re-deriving the curriculum silently changes what every lesson is asking for.
+
+| term | on doubling the episode |
+|---|---|
+| progress | ceiling unchanged at `w_prog`, but reached at **half** the speed |
+| dense velocity | unchanged — `ApplyVelocityReward` divides by `MaxDecisions` |
+| control costs | **doubled** — charged per decision, never normalised |
+| respawn penalty | roughly doubled — it is time-exposure to the same terrain |
+| finish bonus | unchanged in size, but its *reachability* moves by 2× in speed |
+
+The last row is the one that bites. Below the finishing speed the reward is
+dominated by progress and rises smoothly with pace. At and above it, progress
+saturates and **the finish bonus becomes the only term that still varies with
+speed** — while the dense velocity term actually *falls*, because an agent that
+finishes early collects a smaller share of a budget sized for a whole episode.
+
+So a `finish_bonus` chosen when finishing was out of reach will be far too small
+once it is not, and the reward goes flat exactly where the run is trying to
+climb. Run 005 measured this: at 120 s with the run 003 value of 5.0, the target
+gaits for gentle / moderate / hard score 12.07 / 12.20 / 11.87 — not even
+monotone, so no threshold could separate those lessons. Raising `finish_bonus`
+to 15.0 restored a 4.3-point spread between a bare finish and a 2.5 m/s one.
+
+**Any change to `max_episode_steps` must re-run the derivation and re-fit every
+curriculum threshold.** `scripts/reward005.py` is that derivation; it reproduces
+the shipped run 003 table to within 0.02 before computing anything new, which is
+what makes its new numbers trustworthy.
+
 ---
 
 ## 6. Curriculum

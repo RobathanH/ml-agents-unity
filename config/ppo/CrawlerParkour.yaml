@@ -70,7 +70,15 @@ behaviors:
     # extension while still decaying the learning rate to a third of its start.
     # The inherited 80000000 was ~4x any run this project has ever booked, which
     # is why LR and beta sat at their initial values for all of run 002.
-    max_steps: 30000000
+    #
+    # Run 005: 24h booked, the standing ceiling, with NO extension available --
+    # so unlike every previous run this number does not need extension headroom
+    # and should sit as close to the real total as the throughput estimate
+    # allows. Run 004 measured 23.5M in 8.0h = ~820 steps/s; the longer episode
+    # below removes half the resets, so 24h lands at or a little above 71M.
+    # Undershooting is the cheap error (training just ends early and the
+    # watchdog terminates on its own), overshooting leaves LR high at the end.
+    max_steps: 72000000
     time_horizon: 1000
     summary_freq: 10000
     # No self_play block. Parkour is single-agent against a fixed task, so
@@ -78,11 +86,39 @@ behaviors:
     # readable directly from reward instead of needing ELO.
 
 environment_parameters:
-  max_episode_steps: 3000
+  # 6000 x 0.02s = 120s. Doubled for run 005, because runs 003 and 004 both had
+  # episode length pinned at the cap for their entire length -- effectively
+  # EVERY episode timed out. At 60s a 128m track needs 2.13 m/s to finish and
+  # run 004 topped out near 0.64, so the finish bonus was unreachable and the
+  # only live gradient was the progress ratchet. At 120s finishing needs 1.06
+  # m/s, which is roughly one doubling away from where run 004 actually got to.
+  #
+  # This does NOT scale the reward uniformly -- see scripts note in DESIGN.md
+  # and the derivation the thresholds below come from:
+  #   progress  caps at 10.0 either way, but is now reached at HALF the speed
+  #   velocity  whole-episode budget (ApplyVelocityReward divides by
+  #             MaxDecisions), so unchanged -- except an agent that finishes
+  #             early collects only the fraction of the budget it was alive for
+  #   cost      charged PER DECISION and never normalised, so it DOUBLES
+  #   respawns  roughly double, being time-exposure to the same terrain
+  max_episode_steps: 6000
 
   # Reward shape. Progress dominates; everything else prices a cost.
   progress_weight: 10.0
-  finish_bonus: 5.0
+  # 5.0 cannot survive the longer episode. Once finishing is reachable, progress
+  # saturates at 10.0 and the bonus is the ONLY term that still varies with
+  # speed -- the dense velocity term actually FALLS as the agent gets faster,
+  # because finishing early truncates how much of its budget it collects. At
+  # finish_bonus 5.0 the whole ladder above the finishing speed collapses into
+  # noise: 120s episodes score gentle 12.07, moderate 12.20, hard 11.87, which
+  # is not even monotone, so no threshold can separate those lessons and the
+  # curriculum would stall wherever it first landed.
+  #
+  # 15.0 restores the gradient the run exists to climb. Bare finish (1.06 m/s)
+  # pays 7.5; 2.5 m/s pays 11.8. That 4.3 spread is what makes speed worth the
+  # extra respawns, and it keeps the documented velocity_weight ceiling
+  # (finish_bonus / 2 = 7.5) far above the 2.0 actually set.
+  finish_bonus: 15.0
   # A respawn already costs the time to re-cover the ground (progress pays only
   # on max-so-far), so this is a nudge, not the real price of failure. Keeping
   # it small is the point: a large terminal-feeling penalty reproduces sumo's
@@ -107,13 +143,18 @@ environment_parameters:
   # velocity_weight is the WHOLE-EPISODE budget for perfect locomotion (the
   # agent divides by decisions-per-episode), which keeps it commensurable with
   # progress_weight and the finish bonus. It must stay below finish_bonus / 2 =
-  # 2.5, the amount the finish bonus varies by over an episode -- above that,
+  # 7.5, the amount the finish bonus varies by over an episode -- above that,
   # dawdling to the finish line collects more dense reward than the early-finish
-  # bonus it gives up, and slow finishes beat fast ones.
+  # bonus it gives up, and slow finishes beat fast ones. Left at 2.0 through the
+  # run 005 change deliberately: raising it would not buy speed anyway, since an
+  # agent that finishes early collects less of this budget, not more.
   velocity_weight: 2.0
-  # 60s episode (3000 steps x 0.02s) over a 128m track (16 x 8m) needs 2.13 m/s
-  # to finish. 2.5 gives that a margin. The reward decays either side of it, so
-  # there is nothing to gain from sprinting.
+  # A 120s episode (6000 steps x 0.02s) over a 128m track (16 x 8m) needs only
+  # 1.06 m/s to finish, so 2.5 is no longer "the finishing speed plus margin" --
+  # it is now an aspiration well past it, and that is the point. The finish
+  # bonus is what pays for speed above 1.06; this term keeps a smooth gradient
+  # pointing that way. The reward decays either side of it, so there is nothing
+  # to gain from sprinting past 2.5.
   target_speed: 2.5
 
   # Control costs, carried over from CrawlerSumo run 013. Without an energy
@@ -141,22 +182,49 @@ environment_parameters:
   # Thresholds rebuilt from the geometry for run 003, not adjusted: run 002's
   # assumed a control cost of ~1.2/episode against a measured 0.555, and the
   # dense velocity term and the cost ramp have both moved the scale again.
+  # REBUILT AGAIN for run 005, because doubling max_episode_steps moves every
+  # term by a different factor (see the note there). Run 003's ladder was
+  #     flat 3.0  gentle 5.0  moderate 7.0  hard 8.5
+  # and at 120s the same target gaits score 5.86 / 12.07 / 12.20 / 11.87 --
+  # not monotone, so those thresholds are not merely stale, they are unusable.
   #
-  # A 60s episode (3000 steps x 0.02s) over a 128m track (16 x 8m) means a
-  # steady speed s covers fraction P = s / 2.133 of the track and earns
-  #     R = 10*P + 2*V(s) - 0.5*respawns - 1.2*lerp(0.1, 1, difficulty)
-  # with V(s) = (1 - (|s-2.5|/2.5)^2)^2, the dense term's per-decision shape.
+  # Model, matching the code term for term (reward005.py reproduces the run 003
+  # table above to within 0.02, which is what makes it trustworthy here):
+  #     distance = min(s*T, 127)          finish triggers at TrackLength - 1
+  #     R = 10*distance/128
+  #       + 2*V(s)*f                      f = fraction of the episode survived
+  #       + 15*(1 - 0.5*f)                only if it finished
+  #       - 2.4*f*lerp(0.1, 1, difficulty)
+  #       - 0.5*respawns
+  # with V(s) = (1 - (|s-2.5|/2.5)^2)^2, T = 120s.
   #
-  #   lesson    s(m/s)  P     V     respawns  cost  ->  R     threshold
-  #   flat      0.64    0.30  0.20  0.3       0.12      3.13   3.0
-  #   gentle    1.07    0.50  0.45  0.5       0.39      5.27   5.0
-  #   moderate  1.49    0.70  0.70  1.0       0.66      7.24   7.0
-  #   hard      1.81    0.85  0.85  1.5       0.93      8.53   8.5
+  # Each lesson's target gait is a real step past what run 005's WARM START
+  # already earns at that lesson, not past what it earns on flat. Run 004's
+  # final policy (0.638 m/s) scores 6.04 / 5.45 / 4.86 / 4.22 / 3.58 across
+  # difficulties 0 / 0.25 / 0.5 / 0.75 / 1.0, so a threshold under ~6 on flat
+  # would advance it for free and teach it nothing.
   #
-  # Each lesson therefore asks for a real gait covering 30/50/70/85 percent of
-  # the track. The 1.2 is a walking agent's control cost, not the 0.555 run 002
-  # measured -- that was a motionless policy, and energy is mean squared joint
-  # strength, which a vigorous gait drives toward its maximum of 1.2.
+  #   lesson    s(m/s)  finishes  prog   vel   bonus  cost  resp  R      thresh
+  #   flat      0.85    no         7.97  0.64   0.00  0.24  0.10   8.27   8.0
+  #   gentle    1.05    no         9.84  0.88   0.00  0.78  0.30   9.64   9.5
+  #   moderate  1.20    yes        9.92  0.94   8.39  1.16  0.80  17.28  17.0
+  #   hard      1.60    yes        9.92  1.00  10.04  1.23  1.50  18.23  18.0
+  #
+  # The jump at moderate is the point, not an accident: below it a lesson can be
+  # cleared by covering ground, at and above it the track must actually be
+  # FINISHED. Nothing in runs 001-004 ever demanded that, because nothing in
+  # them could deliver it.
+  #
+  # The 2.4 is a walking agent's control cost over 1200 decisions -- twice run
+  # 003's 1.2 over 600, since the cost is charged per decision and never
+  # normalised. It is not the 0.555 run 002 measured; that was a motionless
+  # policy, and energy is mean squared joint strength, which a vigorous gait
+  # drives toward its maximum.
+  #
+  # Respawn estimates remain the loosest input and are still erred LENIENT, and
+  # for the same reason as run 003: a threshold set too high strands the agent
+  # on a lesson it has already mastered and wastes the whole run, while one set
+  # slightly too low advances it early, which it can still learn out of.
   #
   # That estimate is the loosest part of this and it is deliberately erred
   # LENIENT. A threshold set too high strands the agent on a lesson it has
@@ -173,7 +241,7 @@ environment_parameters:
           behavior: CrawlerParkour
           signal_smoothing: true
           min_lesson_length: 100
-          threshold: 3.0
+          threshold: 8.0
         value: 0.0
       - name: gentle
         completion_criteria:
@@ -181,7 +249,7 @@ environment_parameters:
           behavior: CrawlerParkour
           signal_smoothing: true
           min_lesson_length: 100
-          threshold: 5.0
+          threshold: 9.5
         value: 0.25
       - name: moderate
         completion_criteria:
@@ -189,7 +257,7 @@ environment_parameters:
           behavior: CrawlerParkour
           signal_smoothing: true
           min_lesson_length: 100
-          threshold: 7.0
+          threshold: 17.0
         value: 0.5
       - name: hard
         completion_criteria:
@@ -197,7 +265,7 @@ environment_parameters:
           behavior: CrawlerParkour
           signal_smoothing: true
           min_lesson_length: 100
-          threshold: 8.5
+          threshold: 18.0
         value: 0.75
       - name: max
         value: 1.0
