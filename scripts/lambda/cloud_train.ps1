@@ -23,6 +23,14 @@ param(
     [string]$ApiKeyFile = "C:\Users\rob\ssh_keys\lambda_api_key.txt",
     [string]$RepoUrl = "https://github.com/robathanh/ml-agents-unity.git",
     [string]$Branch = "crawler-sumo",
+    # Trainer config and env binary on the instance. Defaults are empty, which
+    # leaves launch_training.sh on its CrawlerSumoEGNN defaults, so existing
+    # sumo invocations are unaffected. For another project pass e.g.
+    #   -Branch crawler-parkour
+    #   -Config config/ppo/CrawlerParkour.yaml
+    #   -EnvBin envs/CrawlerParkour_Multi_linux/CrawlerParkour.x86_64
+    [string]$Config = "",
+    [string]$EnvBin = "",
     [string]$BuildTgz = "",
     # Project tag. Defaults to the run-id with its trailing _NNN stripped
     # (CrawlerSumoEGNN_014 -> CrawlerSumoEGNN). This is the OWNERSHIP KEY for
@@ -46,6 +54,27 @@ $ApiKey = (Get-Content $ApiKeyFile -Raw).Trim()
 $Headers = @{ Authorization = "Bearer $ApiKey" }
 if (-not $BuildTgz) { $BuildTgz = Join-Path $PSScriptRoot "..\..\envs\CrawlerSumoEGNN_Multi_linux.tgz" }
 if (-not (Test-Path $BuildTgz)) { throw "Build archive not found: $BuildTgz" }
+
+# The ARCHIVE is what uploads, not the build directory. Nothing otherwise ties
+# the two together, so a rebuild that skips re-archiving silently trains the
+# PREVIOUS run's environment under the current run's config -- and the numbers
+# look entirely plausible. Caught exactly this before run 014 (12:48 archive
+# vs 21:39 binaries, which would have kept the removed shrinking ring).
+$buildDir = $BuildTgz -replace '\.tgz$', ''
+if (Test-Path $buildDir) {
+    $tgzTime = (Get-Item $BuildTgz).LastWriteTime
+    $newestBin = Get-ChildItem $buildDir -Recurse -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($newestBin -and $newestBin.LastWriteTime -gt $tgzTime) {
+        $parent = Split-Path $buildDir -Parent
+        $leaf = Split-Path $buildDir -Leaf
+        throw ("Build archive is STALE and would train the wrong environment.`n" +
+               "  archive:  $BuildTgz ($tgzTime)`n" +
+               "  binary:   $($newestBin.Name) ($($newestBin.LastWriteTime))`n" +
+               "Re-create it, then relaunch:`n" +
+               "  tar -czf '$BuildTgz' -C '$parent' '$leaf'")
+    }
+}
 if (-not $Project) {
     $Project = if ($RunId -match '^(.+)_\d+$') { $Matches[1] } else { $RunId }
 }
@@ -145,7 +174,11 @@ Invoke-Ssh $ip "(umask 177 && echo '$ApiKey' > ~/.lambda_api_key)"
 
 # --- 8. Start training + watchdog ---
 $extra = if ($Resume) { "--resume" } else { "" }
-Invoke-Ssh $ip "bash ml-agents/scripts/lambda/launch_training.sh $RunId $NumEnvs $extra"
+# Paths are relative to the repo on the instance; expand them there.
+$envPrefix = ""
+if ($Config) { $envPrefix += "CONFIG=`$HOME/ml-agents/$Config " }
+if ($EnvBin) { $envPrefix += "ENV_BIN=`$HOME/ml-agents/$EnvBin " }
+Invoke-Ssh $ip "$envPrefix bash ml-agents/scripts/lambda/launch_training.sh $RunId $NumEnvs $extra"
 $limitMin = [int]([math]::Round($TimeLimitHours * 60))
 Invoke-Ssh $ip "tmux new-window -t train -n watchdog 'bash ~/ml-agents/scripts/lambda/watchdog.sh $instanceId $limitMin $GraceMinutes 2>&1 | tee -a ~/watchdog.log'"
 
