@@ -93,22 +93,40 @@ Checkpoints only exist on the instance until synced. The instance is destroyed
 on schedule. Therefore:
 
 - `sync_cloud_staging.ps1` mirrors artifacts into `results/cloud_staging/`.
-  `-Project <p>` restricts the pull to your own instances; omit it (as the
-  durable scheduled task does) to cover every active instance.
+  `-Project <p>` restricts the pull to your own instances **and stages into the
+  worktree the script was invoked from** — the right mode for a manual or
+  session-bound sync. Omit it (as the durable scheduled task does) to cover
+  every active instance.
+- **With no `-Project`, each instance's files are routed to the staging root of
+  the worktree that owns that project**, so one scheduled task serves every
+  project correctly. Ownership is read from
+  `results/cloud_staging/management_<Project>.md` — §7 already makes that file
+  mandatory, one per project, sitting in exactly the root that project stages
+  into, so it is a registry that cannot drift out of sync with reality. A
+  project with no journal yet falls back to the task's own root and logs a
+  `NOTE:` line; nothing is ever dropped, the fallback is just visible.
 - **Pruning always groups run dirs by project and applies `-MaxGB` to each
-  group independently**, so one project's growth can never evict another
-  project's only copy of a checkpoint. `_misc` (gifs, eval, loose logs) is
-  file-pruned but never deleted wholesale.
+  group independently**, in every root touched, so one project's growth can
+  never evict another project's only copy of a checkpoint. `_misc` (gifs, eval,
+  loose logs) is file-pruned but never deleted wholesale.
 - Concurrent syncs are serialized per staging root by a `sync.pid` file, not
   by command-line matching — every worktree's root is called `cloud_staging`,
-  so a command-line match would kill another project's live sync.
+  so a command-line match would kill another project's live sync. A routed sync
+  takes the lock in each root it writes to and skips any root whose own sync is
+  already live.
 - Staging is **deletable space**. Promote anything worth keeping (e.g. to
   `Project/Assets/<Project>/Models/`) before the pruner reaches it.
 
 The durable Windows scheduled task `UnityRL_CloudStagingSync` is the fail-safe
-that survives session death. Registering scheduled tasks is a user action —
-ask, don't attempt it. Run 006 lost ~13M steps of checkpoints to a
+that survives session death. Run 006 lost ~13M steps of checkpoints to a
 session-bound sync loop dying with its session; that is why this exists.
+
+**A new project needs no new scheduled task** — that is the point of routing.
+Registering one requires an elevated token (`Register-ScheduledTask` returns
+`Access is denied`, HRESULT 0x80070005, for a non-elevated shell even when the
+user is in Administrators), so a design that needed one task per project would
+be blocked on the user every time. Creating a project's `management_<Project>.md`
+before its first launch is the only step required, and it is already §9 step 4.
 
 ## 6. Local serialization
 
@@ -159,7 +177,10 @@ the repo.
 2. Pick a `Project` tag; name run-ids `<Project>_NNN`.
 3. Add the behavior's tags to `BEHAVIOR_TAGS` in `scripts/read_run_stats.py`.
 4. Create `results/cloud_staging/management_<Project>.md` with the directive,
-   guardrails, judgment battery and decision rules.
+   guardrails, judgment battery and decision rules. **Do this before the first
+   launch, not after** — §5 routing reads this file to decide which worktree
+   your checkpoints land in, so without it they stage into whichever worktree
+   hosts the scheduled task and your own tools will not find them.
 5. Build the Linux trainer tgz; launch with `-RunId`, `-Branch`, `-Config`,
    `-EnvBin`, `-BuildTgz`.
 6. Verify the preflight showed your instance as the only one for your tag, and
