@@ -325,6 +325,20 @@ public static class CrawlerParkourBuilder
 
     static CrawlerParkourAgent ConfigureCrawler(GameObject crawler, int layer)
     {
+        // DecisionRequester first, and it is not optional to do so.
+        // [RequireComponent(typeof(Agent))] makes Unity REFUSE to destroy the
+        // example CrawlerAgent while a DecisionRequester is present -- it logs
+        // "Can't remove CrawlerAgent (Script) because DecisionRequester (Script)
+        // depends on it" and carries on, so the build still "succeeds" with two
+        // Agent components on one GameObject. That is illegal in ML-Agents and
+        // shows up only at runtime, as a NullReferenceException in
+        // AgentInfo.CopyActions, after the trainer has already been paid for.
+        // The requester is re-added further down, once our agent exists.
+        foreach (var stale in crawler.GetComponents<DecisionRequester>())
+        {
+            UnityEngine.Object.DestroyImmediate(stale, true);
+        }
+
         foreach (var component in crawler.GetComponents<Component>().ToArray())
         {
             // The example agent, and a RigidBodySensorComponent that would append
@@ -335,6 +349,18 @@ public static class CrawlerParkourBuilder
             {
                 UnityEngine.Object.DestroyImmediate(component, true);
             }
+        }
+
+        // Assert it actually happened. DestroyImmediate reports refusal to the
+        // log and returns void, so without this the failure is silent.
+        var strays = crawler.GetComponents<Agent>();
+        if (strays.Length > 0)
+        {
+            throw new Exception(
+                $"{strays.Length} Agent component(s) survived removal on '{crawler.name}': "
+                + string.Join(", ", strays.Select(a => a.GetType().Name))
+                + ". Something still depends on them; a build with two Agents on one "
+                + "GameObject fails at runtime in AgentInfo.CopyActions.");
         }
 
         var parts = crawler.GetComponentsInChildren<Transform>(true);
@@ -598,6 +624,27 @@ public static class CrawlerParkourBuilder
                 .Where(c => c != null)
                 .ToList();
             Debug.Log($"Verify: {arenas.Count} arenas in {MultiScenePath}");
+
+            // Exactly one Agent per crawler. Two is legal to SERIALIZE but not to
+            // run: ML-Agents allocates action buffers per Agent from the single
+            // shared BehaviorParameters, and the second one dies in
+            // AgentInfo.CopyActions. Run 001 was launched, provisioned and paid
+            // for before this surfaced -- geometry checks cannot see it, because
+            // nothing here steps the Academy.
+            foreach (var controller in arenas)
+            {
+                foreach (var agent in controller.GetComponentsInChildren<Agent>(true))
+                {
+                    var all = agent.GetComponents<Agent>();
+                    if (all.Length == 1 && all[0] is CrawlerParkourAgent) continue;
+                    Debug.LogError(
+                        $"{agent.gameObject.name}: expected exactly one CrawlerParkourAgent, found "
+                        + $"{all.Length} Agent component(s): {string.Join(", ", all.Select(a => a.GetType().Name))}");
+                    ok = false;
+                    break;
+                }
+                if (!ok) break;
+            }
 
             foreach (var index in new[] { 0, arenas.Count - 1 })
             {
