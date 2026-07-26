@@ -62,9 +62,15 @@ behaviors:
         gamma: 0.995
         strength: 1.0
     keep_checkpoints: 5
-    # Schedule denominator, not just a cap: linear decay interpolates to zero
-    # here, so this must match the run length actually intended.
-    max_steps: 80000000
+    # Schedule denominator AND a hard stop: linear decay interpolates to zero
+    # here and the trainer exits here, so this has to bracket the run actually
+    # booked. Too low and the instance idles on the clock after training ends;
+    # too high and the schedules never move. Run 002 measured ~490 steps/s, so
+    # the 12h booked for run 003 lands near 21M, and 30M leaves room for one +5h
+    # extension while still decaying the learning rate to a third of its start.
+    # The inherited 80000000 was ~4x any run this project has ever booked, which
+    # is why LR and beta sat at their initial values for all of run 002.
+    max_steps: 30000000
     time_horizon: 1000
     summary_freq: 10000
     # No self_play block. Parkour is single-agent against a fixed task, so
@@ -84,25 +90,81 @@ environment_parameters:
   respawn_penalty: 0.5
   fall_depth: 3.0
 
+  # Dense locomotion reward -- the fix for run 002, which converged on standing
+  # still at 5.5M steps and never recovered.
+  #
+  # Run 002's only positive terms were the progress ratchet and the finish
+  # bonus, against control costs charged every decision. The ratchet pays only
+  # when the agent beats its own deepest-ever z, so flailing forward and back
+  # earns nothing from it while being charged in full, and once MaxProgress is
+  # set the gradient it offers is gated behind exceeding that mark again. So
+  # before a gait exists the only term with a reliable sign is the cost, and the
+  # reward-maximising policy is stillness -- which PPO found by 5.5M steps and
+  # never left. This term pays for down-track velocity at the instant it
+  # happens, with no history to beat, so there is a smooth local gradient from
+  # the first forward twitch.
+  #
+  # velocity_weight is the WHOLE-EPISODE budget for perfect locomotion (the
+  # agent divides by decisions-per-episode), which keeps it commensurable with
+  # progress_weight and the finish bonus. It must stay below finish_bonus / 2 =
+  # 2.5, the amount the finish bonus varies by over an episode -- above that,
+  # dawdling to the finish line collects more dense reward than the early-finish
+  # bonus it gives up, and slow finishes beat fast ones.
+  velocity_weight: 2.0
+  # 60s episode (3000 steps x 0.02s) over a 128m track (16 x 8m) needs 2.13 m/s
+  # to finish. 2.5 gives that a margin. The reward decays either side of it, so
+  # there is nothing to gain from sprinting.
+  target_speed: 2.5
+
   # Control costs, carried over from CrawlerSumo run 013. Without an energy
   # cost the 8 strength dims saturate at maximum stiffness (strictly dominant)
   # and control collapses to bang-bang targets against rigid PD joints.
   energy_cost_weight: 0.002
   action_rate_cost_weight: 0.002
+  # ...but ramped in with the curriculum rather than charged in full from step 1
+  # (the controller scales both weights by lerp(floor, 1, difficulty)). These
+  # costs make an efficient gait out of a working one; they cannot make a
+  # working one out of nothing, and in run 002 they were the only term with a
+  # reliable sign, which is what made stillness pay. At 0.1 the flat lesson
+  # charges ~0.055/episode against a dense budget of 2.0, so even a feeble
+  # 0.25 m/s shuffle out-earns standing still by ~30%.
+  control_cost_floor: 0.1
 
-  # Single scalar driving every obstacle bound (see ParkourDifficulty).
+  # Single scalar driving every obstacle bound (see ParkourDifficulty). It also
+  # scales the control costs -- see control_cost_floor above.
   #
   # measure: reward, NOT progress. ML-Agents' "progress" measure is
   # trainer_steps / max_steps -- elapsed training time, not how far the agent
   # got -- so thresholds on it would make this a fixed clock schedule that
   # advances whether or not the agent can handle the next lesson.
   #
-  # Reward is readable here because progress_weight is 10 and progress reward is
-  # 10 * (fraction of track covered), so mean reward ~= 10 * fraction, shifted by
-  # the finish bonus (+2.5..5 when it finishes) and control costs (~-1.2 per
-  # episode). The thresholds below therefore sit at roughly 15 / 30 / 50 / 70
-  # percent of the track. They are approximate by construction: if the control
-  # cost weights change, re-derive them rather than assuming they still map.
+  # Thresholds rebuilt from the geometry for run 003, not adjusted: run 002's
+  # assumed a control cost of ~1.2/episode against a measured 0.555, and the
+  # dense velocity term and the cost ramp have both moved the scale again.
+  #
+  # A 60s episode (3000 steps x 0.02s) over a 128m track (16 x 8m) means a
+  # steady speed s covers fraction P = s / 2.133 of the track and earns
+  #     R = 10*P + 2*V(s) - 0.5*respawns - 1.2*lerp(0.1, 1, difficulty)
+  # with V(s) = (1 - (|s-2.5|/2.5)^2)^2, the dense term's per-decision shape.
+  #
+  #   lesson    s(m/s)  P     V     respawns  cost  ->  R     threshold
+  #   flat      0.64    0.30  0.20  0.3       0.12      3.13   3.0
+  #   gentle    1.07    0.50  0.45  0.5       0.39      5.27   5.0
+  #   moderate  1.49    0.70  0.70  1.0       0.66      7.24   7.0
+  #   hard      1.81    0.85  0.85  1.5       0.93      8.53   8.5
+  #
+  # Each lesson therefore asks for a real gait covering 30/50/70/85 percent of
+  # the track. The 1.2 is a walking agent's control cost, not the 0.555 run 002
+  # measured -- that was a motionless policy, and energy is mean squared joint
+  # strength, which a vigorous gait drives toward its maximum of 1.2.
+  #
+  # That estimate is the loosest part of this and it is deliberately erred
+  # LENIENT. A threshold set too high strands the agent on a lesson it has
+  # already mastered and wastes the whole run; one set slightly too low advances
+  # it early, which it can still learn out of. Respawn estimates rise with
+  # difficulty because obstacles are what cause falls: a run that stalls just
+  # under a threshold with respawns well above these is being blocked by the
+  # penalty, not by locomotion.
   difficulty:
     curriculum:
       - name: flat
@@ -111,7 +173,7 @@ environment_parameters:
           behavior: CrawlerParkour
           signal_smoothing: true
           min_lesson_length: 100
-          threshold: 1.5
+          threshold: 3.0
         value: 0.0
       - name: gentle
         completion_criteria:
@@ -119,7 +181,7 @@ environment_parameters:
           behavior: CrawlerParkour
           signal_smoothing: true
           min_lesson_length: 100
-          threshold: 3.0
+          threshold: 5.0
         value: 0.25
       - name: moderate
         completion_criteria:
@@ -127,7 +189,7 @@ environment_parameters:
           behavior: CrawlerParkour
           signal_smoothing: true
           min_lesson_length: 100
-          threshold: 5.0
+          threshold: 7.0
         value: 0.5
       - name: hard
         completion_criteria:
@@ -135,7 +197,7 @@ environment_parameters:
           behavior: CrawlerParkour
           signal_smoothing: true
           min_lesson_length: 100
-          threshold: 7.0
+          threshold: 8.5
         value: 0.75
       - name: max
         value: 1.0

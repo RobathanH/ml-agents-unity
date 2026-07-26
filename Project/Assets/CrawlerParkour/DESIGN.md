@@ -251,8 +251,16 @@ Speed is the whole objective; everything else is a cost or a correction.
 - **Progress**: `w_prog · max(0, z − z_max_so_far)`. Paying only for *new* ground
   means oscillating back and forth earns nothing and a respawn costs exactly the
   time to re-cover the ground — no double-payment, no farming.
+- **Dense velocity** (added for run 003): `w_vel · speed(v_z) · heading / decisions`,
+  the stock Crawler's shape — 1 at `target_speed`, 0 at standstill and at twice
+  target. It is unsigned and zero going backwards, so it does *not* reintroduce
+  the oscillation farming the ratchet exists to prevent. `w_vel` is the
+  whole-episode budget, and must stay under `finish_bonus / 2` or dawdling to the
+  finish line out-earns the early-finish bonus it gives up.
 - **Finish bonus** scaled by remaining time, so finishing faster is strictly better.
-- **Control costs**: energy + action-rate, carried over from run 013.
+- **Control costs**: energy + action-rate, carried over from run 013, but scaled
+  by `lerp(control_cost_floor, 1, difficulty)` so the flat lesson barely charges
+  them. They make a working gait efficient; they cannot make a gait exist.
 - **No alive bonus** — it would pay for stalling.
 
 ### Risk pricing (the lesson from sumo)
@@ -271,6 +279,17 @@ crawls overhangs, because progress reward is linear in distance and the finish
 bonus is time-scaled. Obstacles that *can* be walked around are prevented by the
 width-spanning rule (§3.1). This is the check every future difficulty change must
 re-pass.
+
+**Run 002 showed this test was asking the wrong question.** It compares policies
+that all make progress, and the laziest policy is not a lazy *walk* — it is not
+walking at all. Standing still scored better than random flailing, because the
+only positive terms were conditional on net displacement while the costs were
+charged every step, so the reward-maximising policy before any gait exists is to
+stop moving. Reward rose by a full point over 5.5M steps while ProgressFraction
+*fell*. Ask the question at both ends: what does the best policy score, and what
+does the policy that does **nothing** score — and is there a smooth path of
+improving reward between them? The dense velocity term is what supplies that
+path.
 
 ---
 

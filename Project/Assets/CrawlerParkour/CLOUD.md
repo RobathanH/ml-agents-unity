@@ -95,6 +95,11 @@ the layout variance too.
 
 Lesson `flat` (difficulty 0) is close to open ground: 12m wide, 0.2 steps, no
 pebbles. It exists so locomotion is solved before any obstacle reasoning is
-required. If reward is still under the 1.5 threshold after a few million steps
+required. If reward is still under the 3.0 threshold after a few million steps
 the problem is locomotion or the observation wiring, not the track — check the
 height field is not reading the crawler's own legs (`GroundMask`).
+
+**Read `MeanForwardSpeed` before reward.** Run 002 improved its reward by a full
+point while that stat sat at ~0.02 m/s: it had learned to stand still and bank
+the respawn savings, and the reward curve alone looked like progress. Anything
+under ~0.3 m/s means the crawler is not walking, whatever reward is doing.

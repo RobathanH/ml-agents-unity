@@ -40,6 +40,8 @@ namespace CrawlerParkour
         [System.NonSerialized] public float actionRateCostWeight;
         [System.NonSerialized] public float respawnPenalty;
         [System.NonSerialized] public float finishBonus = 5f;
+        [System.NonSerialized] public float velocityWeight;
+        [System.NonSerialized] public float targetSpeed = 2.5f;
 
         /// <summary>
         /// Everything CollectObservations writes outside the height field:
@@ -62,6 +64,14 @@ namespace CrawlerParkour
         public bool Finished { get; private set; }
         public float EpisodeEnergyCost { get; private set; }
         public float EpisodeActionRateCost { get; private set; }
+        public float EpisodeVelocityReward { get; private set; }
+
+        /// <summary>
+        /// Mean down-track speed over the episode, m/s. The one number that says
+        /// whether the crawler walks: run 002 improved its reward by a full point
+        /// while this sat at ~0.02, so reward alone cannot be read as progress.
+        /// </summary>
+        public float MeanForwardSpeed => m_Decisions > 0 ? m_ForwardSpeedSum / m_Decisions : 0f;
 
         private const int k_NumStrengthActions = 8;
         private JointDriveController m_Jd;
@@ -69,6 +79,9 @@ namespace CrawlerParkour
         private bool m_HasPrevActions;
         private float m_CheckpointZ;
         private Transform[] m_Feet;
+        private int m_DecisionPeriod = 1;
+        private float m_ForwardSpeedSum;
+        private int m_Decisions;
 
         public override void Initialize()
         {
@@ -82,6 +95,12 @@ namespace CrawlerParkour
             }
             m_Feet = new[] { leg0Lower, leg1Lower, leg2Lower, leg3Lower };
             MaxStep = 0;   // controller owns episode length
+
+            // StepCount counts DECISIONS, while the controller's episode cap counts
+            // physics steps -- they differ by this factor. Anything comparing the
+            // two has to divide, which the finish bonus previously did not.
+            var requester = GetComponent<DecisionRequester>();
+            m_DecisionPeriod = requester != null ? Mathf.Max(1, requester.DecisionPeriod) : 1;
         }
 
         /// <summary>
@@ -105,6 +124,9 @@ namespace CrawlerParkour
             m_HasPrevActions = false;
             EpisodeEnergyCost = 0f;
             EpisodeActionRateCost = 0f;
+            EpisodeVelocityReward = 0f;
+            m_ForwardSpeedSum = 0f;
+            m_Decisions = 0;
         }
 
         /// <summary>
@@ -235,8 +257,71 @@ namespace CrawlerParkour
             bp[leg2Lower].SetJointStrength(c[++i]);
             bp[leg3Lower].SetJointStrength(c[++i]);
 
+            ApplyVelocityReward();
             ApplyProgressReward();
             ApplyControlCosts(c);
+        }
+
+        /// <summary>
+        /// Pays every decision for moving down-track at roughly target speed while
+        /// facing that way. This is the term run 002 did not have, and its absence
+        /// is why that run converged on standing still.
+        /// </summary>
+        /// <remarks>
+        /// The progress ratchet and the finish bonus are the only other positive
+        /// terms and both are conditional on NET forward displacement, while the
+        /// control costs are charged every step. Before a gait exists that pairing
+        /// makes stillness strictly optimal -- the agent pays continuously and earns
+        /// nothing -- and PPO finds that optimum quickly and never leaves.
+        ///
+        /// Shape is the stock ML-Agents Crawler's: 1 at target speed, falling to 0
+        /// at standstill AND at twice target, so there is nothing to gain by
+        /// sprinting and nothing to gain by reversing. Because it is unsigned and
+        /// zero for backward motion, oscillating over the same stretch earns
+        /// nothing, which is the exploit the ratchet was chosen to avoid -- so this
+        /// term can be added without giving that exploit back.
+        ///
+        /// Divided by MaxDecisions so `velocityWeight` reads as the whole-episode
+        /// budget for perfect locomotion rather than a per-step rate. That keeps it
+        /// commensurable with progressWeight and the finish bonus, which is what
+        /// makes the curriculum thresholds derivable at all.
+        /// </remarks>
+        private void ApplyVelocityReward()
+        {
+            if (Finished) return;
+
+            // Track space differs from world space by a translation only
+            // (ToTrack/ToWorld), so a world-space direction is already track-space.
+            float vz = AvgVelocity().z;
+            m_ForwardSpeedSum += vz;
+            m_Decisions++;
+
+            // Speed is accounted above this guard, not below it: MeanForwardSpeed is
+            // the stat that tells run 002's failure apart from real progress, and an
+            // ablation setting velocity_weight to 0 is exactly when it is needed.
+            if (velocityWeight <= 0f || targetSpeed <= 0f) return;
+
+            float d = Mathf.Clamp(Mathf.Abs(vz - targetSpeed), 0f, targetSpeed) / targetSpeed;
+            float speed = (1f - d * d) * (1f - d * d);
+            float heading = (body.forward.z + 1f) * 0.5f;
+
+            float r = velocityWeight * speed * heading / MaxDecisions;
+            AddReward(r);
+            EpisodeVelocityReward += r;
+        }
+
+        /// <summary>
+        /// Mean velocity over every body part rather than the torso alone: torso-only
+        /// velocity is satisfied by throwing the limbs around, which reads as speed
+        /// without moving the animal. Same reasoning as the stock Crawler.
+        /// </summary>
+        private Vector3 AvgVelocity()
+        {
+            var parts = m_Jd.bodyPartsList;
+            if (parts.Count == 0) return Vector3.zero;
+            var sum = Vector3.zero;
+            for (int i = 0; i < parts.Count; i++) sum += parts[i].rb.linearVelocity;
+            return sum / parts.Count;
         }
 
         /// <summary>
@@ -264,14 +349,25 @@ namespace CrawlerParkour
             if (MaxProgress >= track.TrackLength - 1f)
             {
                 Finished = true;
-                float timeLeft = StepCount > 0 ? 1f - Mathf.Clamp01(StepCount / (float)Mathf.Max(1, MaxStepOverride)) : 0f;
+                // Against MaxDecisions, not MaxStepOverride: StepCount counts
+                // decisions and the override counts physics steps, so the old
+                // comparison understated elapsed time by DecisionPeriod (5x) and
+                // left this bonus almost flat -- 5.0 down to 4.5 across a whole
+                // episode. It has to out-vary the dense velocity budget or dawdling
+                // to the finish line pays better than sprinting to it.
+                float timeLeft = 1f - Mathf.Clamp01(StepCount / (float)MaxDecisions);
                 AddReward(finishBonus * (0.5f + 0.5f * timeLeft));
             }
         }
 
-        /// <summary>Episode length the controller is enforcing; used to scale the
-        /// finish bonus so finishing sooner is strictly better.</summary>
+        /// <summary>Episode length the controller is enforcing, in PHYSICS steps.
+        /// Used to scale the finish bonus so finishing sooner is strictly better.</summary>
         [System.NonSerialized] public int MaxStepOverride = 3000;
+
+        /// <summary>The same cap expressed in decisions, which is the unit
+        /// <see cref="Agent.StepCount"/> uses and the denominator the dense
+        /// velocity reward is normalised by.</summary>
+        public int MaxDecisions => Mathf.Max(1, MaxStepOverride / m_DecisionPeriod);
 
         private void ApplyControlCosts(ActionSegment<float> c)
         {

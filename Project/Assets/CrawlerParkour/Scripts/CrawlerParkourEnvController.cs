@@ -30,6 +30,12 @@ namespace CrawlerParkour
         public float finishBonus = 5f;
         public float energyCostWeight = 0f;
         public float actionRateCostWeight = 0f;
+        [Tooltip("Whole-episode reward budget for perfect down-track locomotion.")]
+        public float velocityWeight = 2f;
+        [Tooltip("Down-track speed the dense reward peaks at, m/s.")]
+        public float targetSpeed = 2.5f;
+        [Tooltip("Fraction of the control costs charged at difficulty 0.")]
+        [Range(0f, 1f)] public float controlCostFloor = 0.1f;
 
         private int m_Steps;
         private int m_EpisodeIndex;
@@ -93,6 +99,9 @@ namespace CrawlerParkour
             energyCostWeight = GetParam("energy_cost_weight", energyCostWeight);
             actionRateCostWeight = GetParam("action_rate_cost_weight", actionRateCostWeight);
             fallDepth = GetParam("fall_depth", fallDepth);
+            velocityWeight = GetParam("velocity_weight", velocityWeight);
+            targetSpeed = GetParam("target_speed", targetSpeed);
+            controlCostFloor = Mathf.Clamp01(GetParam("control_cost_floor", controlCostFloor));
         }
 
         private void ResetEpisode()
@@ -106,9 +115,24 @@ namespace CrawlerParkour
             agent.progressWeight = progressWeight;
             agent.respawnPenalty = respawnPenalty;
             agent.finishBonus = finishBonus;
-            agent.energyCostWeight = energyCostWeight;
-            agent.actionRateCostWeight = actionRateCostWeight;
+            agent.velocityWeight = velocityWeight;
+            agent.targetSpeed = targetSpeed;
             agent.MaxStepOverride = maxEpisodeSteps;
+
+            // Control costs ramp in with the curriculum instead of being charged in
+            // full from step 1. They are what made stillness pay in run 002: before
+            // a gait exists they are the only term with a reliable sign, so the
+            // cheapest policy is to stop moving. Deferring them until there is a
+            // gait to make efficient is the point -- lesson `flat` charges
+            // controlCostFloor of the full price, lesson `max` charges all of it.
+            //
+            // Derived from `difficulty` rather than given its own curriculum block:
+            // two curricula on the same measure advance independently and can
+            // desync, and this way the ramp is visible in the Difficulty stat we
+            // already log.
+            float costScale = Mathf.Lerp(controlCostFloor, 1f, difficulty);
+            agent.energyCostWeight = energyCostWeight * costScale;
+            agent.actionRateCostWeight = actionRateCostWeight * costScale;
 
             // Track space: the generator lays everything out relative to its own
             // root, so a replicated arena is a pure translation of this one.
@@ -155,6 +179,11 @@ namespace CrawlerParkour
             m_Stats.Add("CrawlerParkour/Difficulty", difficulty);
             m_Stats.Add("CrawlerParkour/EnergyCost", agent.EpisodeEnergyCost);
             m_Stats.Add("CrawlerParkour/ActionRateCost", agent.EpisodeActionRateCost);
+            m_Stats.Add("CrawlerParkour/VelocityReward", agent.EpisodeVelocityReward);
+            // Read this before reward. Run 002's reward rose by a full point while
+            // the crawler was motionless, so mean speed is the term that says
+            // whether anything is actually happening.
+            m_Stats.Add("CrawlerParkour/MeanForwardSpeed", agent.MeanForwardSpeed);
             // Steady non-zero repairs mean a pattern is emitting geometry its own
             // feasibility check rejects, and the track is quietly flattening.
             m_Stats.Add("CrawlerParkour/TrackRepairs", track.RepairCount);

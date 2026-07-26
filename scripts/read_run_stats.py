@@ -42,6 +42,11 @@ BEHAVIOR_TAGS = {
         "CrawlerSumo/TimeoutRate",
     ],
     "CrawlerParkour": [
+        # Run 003+: read this FIRST. Run 002 improved its reward by a full point
+        # while mean speed sat at ~0.02 m/s -- it had learned to stand still and
+        # bank the respawn savings. Reward cannot distinguish that from progress;
+        # this can.
+        "CrawlerParkour/MeanForwardSpeed",
         "CrawlerParkour/ProgressFraction",
         "CrawlerParkour/Finished",
         "CrawlerParkour/Respawns",
@@ -49,6 +54,11 @@ BEHAVIOR_TAGS = {
         "CrawlerParkour/FinishSteps",
         "CrawlerParkour/EnergyCost",
         "CrawlerParkour/ActionRateCost",
+        # Run 003+: the dense locomotion term. Its whole-episode budget is
+        # velocity_weight, so this divided by that weight is the fraction of a
+        # perfect run achieved. Control costs now ramp with Difficulty, so
+        # EnergyCost rising across a lesson boundary is the ramp, not a regression.
+        "CrawlerParkour/VelocityReward",
         # Should sit at ~0. Sustained non-zero means a segment pattern is
         # emitting geometry its own feasibility check rejects, so the track is
         # quietly rebuilding itself as flat ground and the run is far easier
