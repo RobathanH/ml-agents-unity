@@ -26,13 +26,18 @@ public class CrawlerSumoEnvController : MonoBehaviour
     // public so RolloutViewer's eval mode can match the training config's value
     public int maxEpisodeSteps = 3000;
 
-    // Shrinking ring: from ringShrinkStartStep the effective platform radius
-    // lerps toward platformRadius * ringShrinkEndProportion by episode end.
-    // An agent outside the effective radius counts as fallen even if standing.
-    // Forces decisive outcomes and breaks mutual-turtling equilibria (runs
-    // 006-008 all converged to draw-camping). 1.0 disables the shrink.
-    private int ringShrinkStartStep = 0;
-    private float ringShrinkEndProportion = 1f;
+    // The ring radius is FIXED at platformRadius for the whole episode. Runs
+    // 009-013 shrank it (15u -> 1.5u from step 300) to break the 006-008
+    // draw-camping equilibria; removed 2026-07-26 because the shrink was
+    // invisible to the policy and the observations actively contradicted it:
+    // CollectObservations reports platformRadius/20 as a constant and
+    // normalizedEdgeDistance/onPlatform against the FULL radius, so a crawler
+    // was told it had 11u of margin in the step before a ring-out killed it.
+    // An unobservable, within-episode-varying kill boundary is a second,
+    // implicit shaping channel -- it taught centre-hugging and a low crouch
+    // (brace for the floor vanishing) and it inflates value loss, which is the
+    // same lesson as the run-007 unobserved physics randomization. All
+    // behaviour shaping now lives in one place: the reward terms below.
 
     // Actuator strength: per-episode multiplier sampled from [min, max], applied
     // identically to BOTH crawlers (asymmetric strength would break zero-sum
@@ -181,7 +186,7 @@ public class CrawlerSumoEnvController : MonoBehaviour
     }
 
     // CLI overrides for standalone eval/viewer builds, which have no python
-    // side channel and would otherwise run DEFAULT physics — a policy trained
+    // side channel and would otherwise run DEFAULT physics -- a policy trained
     // under modified constants (e.g. run 011's 1.5x strength) is meaningless
     // to evaluate under different physics. Repeatable arg: --env-param name=value.
     // Lazily parsed: no script-execution-order dependency. Training never
@@ -257,10 +262,6 @@ public class CrawlerSumoEnvController : MonoBehaviour
         // decision, so all 5 physics steps share one discount exponent.
         var dr = crawler1.GetComponent<DecisionRequester>();
         m_DecisionPeriod = dr != null ? Mathf.Max(1, dr.DecisionPeriod) : 1;
-
-        // Shrinking ring
-        ringShrinkStartStep = Mathf.RoundToInt(GetParam("ring_shrink_start_step", ringShrinkStartStep));
-        ringShrinkEndProportion = GetParam("ring_shrink_end_proportion", ringShrinkEndProportion);
 
         // Actuator strength randomization
         jointStrengthMultMin = GetParam("joint_strength_multiplier_min", jointStrengthMultMin);
@@ -526,21 +527,8 @@ public class CrawlerSumoEnvController : MonoBehaviour
         m_C2LastPosition = c2Pos;
     }
 
-    private float EffectiveRadius()
-    {
-        if (ringShrinkEndProportion >= 1f || maxEpisodeSteps <= 0)
-        {
-            return platformRadius;
-        }
-        float t = Mathf.Clamp01(
-            (m_StepCount - ringShrinkStartStep)
-            / (float)Mathf.Max(1, maxEpisodeSteps - ringShrinkStartStep));
-        return platformRadius * Mathf.Lerp(1f, ringShrinkEndProportion, t);
-    }
-
     private bool CheckFallConditions()
     {
-        float effRadius = EffectiveRadius();
         Vector3 p1 = crawler1.body.position;
         Vector3 p2 = crawler2.body.position;
         float d1 = Vector2.Distance(new Vector2(p1.x, p1.z), new Vector2(platformCenter.x, platformCenter.z));
@@ -556,8 +544,8 @@ public class CrawlerSumoEnvController : MonoBehaviour
             c2Flipped = m_C2FlipSteps >= flipKnockdownSteps;
         }
 
-        bool c1Fell = p1.y <= fallY || d1 > effRadius || c1Flipped;
-        bool c2Fell = p2.y <= fallY || d2 > effRadius || c2Flipped;
+        bool c1Fell = p1.y <= fallY || d1 > platformRadius || c1Flipped;
+        bool c2Fell = p2.y <= fallY || d2 > platformRadius || c2Flipped;
         if (c1Fell || c2Fell)
         {
             m_LastEndWasFlip = c1Flipped || c2Flipped;

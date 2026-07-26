@@ -88,15 +88,21 @@ environment_parameters:
   # Episode Settings
   max_episode_steps: 1500
 
-  # Run 009: shrinking ring. Runs 006-008 all converged to mutual turtling
-  # (008: zero decisive games at 29M steps despite reward tweaks). From step
-  # 500 the effective radius lerps to 25% by episode end; agents outside it
-  # count as fallen. Guarantees decisive pressure -> gradient toward pushing.
-  ring_shrink_start_step: 300
-  # Run 010: 0.25 -> 0.10. At 0.25 the final circle (3.75u) fit both crawlers --
-  # they learned to co-huddle peacefully until timeout. 0.10 (1.5u) physically
-  # cannot hold two: someone must be pushed out.
-  ring_shrink_end_proportion: 0.10
+  # Run 014: the SHRINKING RING (runs 009-013) IS GONE -- the arena is a fixed
+  # 15u for the whole episode. It bought decisive endings out of the 006-008
+  # draw-camping, but it bought them with a boundary the policy cannot see:
+  # there is no step-count or ring-radius observation, and the obs it does get
+  # (platform_radius/20, normalized edge distance, on-platform flag) are all
+  # computed against the FULL radius, so they read "11u of margin" one step
+  # before a ring-out. That is a second, implicit shaping channel pushing the
+  # exact behaviours we then spent runs trying to remove -- hug the centre, stay
+  # low in case the floor disappears -- and it puts an unlearnable floor under
+  # value loss. Shaping belongs in the reward terms, where it is explicit and
+  # priced. Decisiveness now has to come from center_control + pushing +
+  # stability, which is what those weights are for.
+  # Evidence this is affordable: every tournament in project history has been
+  # run on a FIXED ring (eval builds never received the ring params), and run
+  # 013's 16M checkpoint scored 39-18-7 = 11% draws there, the lowest ever.
 
   # ------------------- Run 011: direct-impact physics upgrades -------------------
   # Run 010 plateaued: tournament showed the 41M model roughly even with 15.5M
@@ -107,9 +113,13 @@ environment_parameters:
   # value-loss lesson) and we have no evidence the wider ranges are trainable.
 
   # Flip knockdown DISABLED (0 = off): flipping must win through the game, not
-  # by rule. An inverted crawler is nearly immobile, and the shrinking ring
-  # kills immobile agents -- so flipping leads to winning naturally. The
-  # zero-sum stability_reward (0.01/step) is the small shaping nudge.
+  # by rule. Its original justification leaned on the ring ("an inverted
+  # crawler is immobile and the shrinking ring kills immobile agents"); with
+  # the ring fixed, the natural punishment is instead that an immobile crawler
+  # is trivial to shove off a 15u platform. Watch this: if flipped crawlers
+  # start surviving to timeout, the answer is a bigger zero-sum
+  # stability_reward (currently 0.01/step) -- an explicit price -- not a
+  # knockdown rule.
   flip_knockdown_steps: 0
   flip_knockdown_dot: -0.2
 
