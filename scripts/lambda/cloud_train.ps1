@@ -32,7 +32,16 @@ param(
     [string]$Config = "",
     [string]$EnvBin = "",
     [string]$BuildTgz = "",
-    [string]$InstanceName = "unity-rl-train",
+    # Project tag. Defaults to the run-id with its trailing _NNN stripped
+    # (CrawlerSumoEGNN_014 -> CrawlerSumoEGNN). This is the OWNERSHIP KEY for
+    # multi-project use: the instance is named "unity-rl-<Project>", and every
+    # other script identifies whose instance is whose by that name. Agents must
+    # only ever act on instances carrying their own project tag.
+    [string]$Project = "",
+    [string]$InstanceName = "",
+    # Launch even if this project already has a live instance. Off by default:
+    # the standing guardrail is one instance PER PROJECT.
+    [switch]$AllowConcurrent,
     [switch]$Resume
 )
 # NOTE: "Continue" not "Stop" -- in PowerShell 5.1 any native-command stderr
@@ -45,6 +54,30 @@ $ApiKey = (Get-Content $ApiKeyFile -Raw).Trim()
 $Headers = @{ Authorization = "Bearer $ApiKey" }
 if (-not $BuildTgz) { $BuildTgz = Join-Path $PSScriptRoot "..\..\envs\CrawlerSumoEGNN_Multi_linux.tgz" }
 if (-not (Test-Path $BuildTgz)) { throw "Build archive not found: $BuildTgz" }
+if (-not $Project) {
+    $Project = if ($RunId -match '^(.+)_\d+$') { $Matches[1] } else { $RunId }
+}
+if (-not $InstanceName) { $InstanceName = "unity-rl-$Project" }
+
+# --- 0. Multi-project preflight ---
+# Other projects train from their own worktrees against this same Lambda
+# account. Block only on a collision with THIS project; report the others so
+# the combined burn rate is visible before spending more.
+$live = @((Invoke-RestMethod "$Api/instances" -Headers $Headers -ErrorAction Stop).data |
+    Where-Object { $_.status -ne "terminated" })
+$ours = @($live | Where-Object { $_.name -eq $InstanceName })
+if ($ours.Count -gt 0 -and -not $AllowConcurrent) {
+    throw ("$Project already has a live instance ($($ours[0].id), status $($ours[0].status), ip $($ours[0].ip)). " +
+           "One instance per project is the standing guardrail. Terminate it, or pass -AllowConcurrent deliberately.")
+}
+$others = @($live | Where-Object { $_.name -ne $InstanceName })
+if ($others.Count -gt 0) {
+    # PS 5.1 Measure-Object takes a property NAME, not a scriptblock -- project first.
+    $otherRate = ($others | ForEach-Object { $_.instance_type.price_cents_per_hour } |
+        Measure-Object -Sum).Sum / 100
+    Write-Host "NOTE: $($others.Count) instance(s) from other projects already running (`$$otherRate/hr combined):"
+    $others | ForEach-Object { Write-Host "  $($_.name) [$($_.id)] $($_.instance_type.name) - NOT YOURS, do not terminate" }
+}
 
 function Invoke-Ssh([string]$ip, [string]$cmd) {
     ssh -i $KeyFile -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=15 "ubuntu@$ip" $cmd 2>&1 |
