@@ -93,6 +93,12 @@ namespace CrawlerParkour
         {
             difficulty = Mathf.Clamp01(GetParam("difficulty", difficulty));
             maxEpisodeSteps = Mathf.RoundToInt(GetParam("max_episode_steps", maxEpisodeSteps));
+            // Reachable from the CLI so two checkpoints can be compared on the SAME
+            // track. Without it a side-by-side is two policies on two different
+            // random layouts, which reads as a difference in skill and is not one.
+            // Negative (the default) keeps the per-episode randomisation training
+            // needs, so this is inert unless an eval asks for it.
+            fixedSeed = Mathf.RoundToInt(GetParam("fixed_seed", fixedSeed));
             progressWeight = GetParam("progress_weight", progressWeight);
             respawnPenalty = GetParam("respawn_penalty", respawnPenalty);
             finishBonus = GetParam("finish_bonus", finishBonus);
