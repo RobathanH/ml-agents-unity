@@ -100,7 +100,7 @@ namespace CrawlerParkour
     public class ParkourTrackGenerator : MonoBehaviour
     {
         [Header("Track")]
-        public int SegmentCount = 16;
+        public int SegmentCount = 24;
         public float SegmentLength = 8f;
         public float FloorThickness = 2f;
         [Tooltip("Flat run-in before the first patterned segment.")]
@@ -116,7 +116,7 @@ namespace CrawlerParkour
         public GameObject BoxPrefab;
         public Transform BoxParent;
         [Tooltip("Hard ceiling on pooled boxes. Generation stops early if hit.")]
-        public int MaxBoxes = 220;
+        public int MaxBoxes = 330;
 
         [Header("Materials (visual only)")]
         public Material FloorMaterial;
@@ -146,11 +146,22 @@ namespace CrawlerParkour
         // See the Overhang case: keeps the slab top above floor + WallHeight at
         // every difficulty so the only route is underneath it.
         private const float k_OverhangSlabHalfThickness = 1.2f;
+        // Half the crawler's ~3.9m length: how far ahead and behind the body centre
+        // a spawn has to be standing on clear ground.
+        private const float k_SpawnBodyHalf = 2f;
+        // Vertical room a spawn column needs. The controller places the body centre
+        // 1.2m above the surface, so this is that plus margin for the body itself.
+        private const float k_SpawnHeadroom = 1.5f;
+        // Boundaries sampled before giving up. Each tries three lateral positions,
+        // so this is 72 candidate placements; measured failure to find any is 0 in
+        // 60k picks at 24.
+        private const int k_SpawnAttempts = 24;
 
         private readonly List<ParkourBox> m_Pool = new List<ParkourBox>();
         private readonly List<ParkourBox> m_Active = new List<ParkourBox>();
         private readonly List<float> m_SegmentFloorY = new List<float>();
         private readonly List<float> m_LaneCenter = new List<float>();
+        private readonly List<SegmentPattern> m_SegmentPattern = new List<SegmentPattern>();
         private readonly List<ParkourBox> m_SliceCandidates = new List<ParkourBox>();
         private System.Random m_Rng;
         private ParkourDifficulty m_Diff;
@@ -159,6 +170,25 @@ namespace CrawlerParkour
         public float TrackLength => SegmentCount * SegmentLength;
         public float TrackWidth => m_Diff.TrackWidth;
         public ParkourDifficulty Difficulty => m_Diff;
+
+        /// <summary>
+        /// Segments actually laid down. Normally <see cref="SegmentCount"/>, but
+        /// generation stops early when the box budget runs out, and anything that
+        /// indexes segments has to respect the real number rather than the request.
+        /// </summary>
+        public int BuiltSegments => m_SegmentPattern.Count;
+
+        /// <summary>Pattern of a built segment, as PLACED -- a segment that failed
+        /// its corridor check and was rebuilt flat reports Flat, not what it was
+        /// originally rolled as.</summary>
+        public SegmentPattern PatternAt(int index) =>
+            index >= 0 && index < m_SegmentPattern.Count
+                ? m_SegmentPattern[index] : SegmentPattern.Flat;
+
+        /// <summary>Index of the segment containing track-space z, clamped into the
+        /// built range.</summary>
+        public int SegmentIndexAt(float z) => m_SegmentPattern.Count == 0 ? 0
+            : Mathf.Clamp(Mathf.FloorToInt(z / SegmentLength), 0, m_SegmentPattern.Count - 1);
 
         /// <summary>Number of layouts that failed the corridor check and were
         /// rebuilt. Exposed so training can alarm if it is ever non-trivial --
@@ -220,6 +250,7 @@ namespace CrawlerParkour
             m_Active.Clear();
             m_SegmentFloorY.Clear();
             m_LaneCenter.Clear();
+            m_SegmentPattern.Clear();
 
             float halfW = m_Diff.TrackWidth * 0.5f;
             float y = 0f;
@@ -236,11 +267,11 @@ namespace CrawlerParkour
             // was always a scramble not to fall off backwards. That is a start
             // condition, not a skill, and it was being trained on every episode.
             //
-            // Deliberately NOT part of TrackLength: that is the denominator of
-            // ProgressFraction and the finish threshold, so folding the aprons into
-            // it would silently rescale every curriculum threshold and make run 004
-            // incomparable with 002 and 003. The apron is ground to stand on, not
-            // track to cover.
+            // Deliberately NOT part of TrackLength. Under run 006's rate rewards
+            // that no longer rescales anything (nothing divides by TrackLength any
+            // more), but TrackLength is still what indexes segments and bounds the
+            // spawn reserve, and an apron is ground to stand on rather than track to
+            // cover.
             if (StartApron > 0f)
             {
                 AddFloor(-StartApron * 0.5f, 0f, StartApron, m_Diff.TrackWidth, y);
@@ -314,20 +345,26 @@ namespace CrawlerParkour
                     }
                     nextY = y;
                     BuildSegment(i, SegmentPattern.Flat, y, nextY, lane, halfW);
+                    // Recorded as what was PLACED, not what was rolled: the
+                    // per-pattern clear-rate stat would otherwise credit a Squeeze
+                    // the agent never actually met.
+                    pattern = SegmentPattern.Flat;
                 }
 
                 m_SegmentFloorY.Add(y);
                 m_LaneCenter.Add(lane);
+                m_SegmentPattern.Add(pattern);
                 prevPattern = pattern;
                 y = nextY;
             }
 
-            // The same defect sits at the far end, and it bears directly on the
-            // stat that matters: Finished is triggered at TrackLength - 1, so the
-            // crawler has to reach z=127 on a floor ending at z=128 -- its front
-            // feet are over the void for the whole final approach. `y` here is the
-            // height the last segment ended at, so the apron continues that surface
-            // rather than reintroducing a step at the line.
+            // The same defect sits at the far end. Run 006 keeps the spawn far
+            // enough back that a full episode cannot reach here, so this is now a
+            // backstop rather than a hot path -- but a policy that outruns the
+            // reserve should trot off the end onto solid ground rather than fall off
+            // a cliff and record a fall the terrain never actually posed. `y` here
+            // is the height the last segment ended at, so the apron continues that
+            // surface rather than reintroducing a step.
             if (FinishApron > 0f)
             {
                 AddFloor(TrackLength + FinishApron * 0.5f, 0f, FinishApron,
@@ -703,6 +740,119 @@ namespace CrawlerParkour
             }
             return !float.IsNegativeInfinity(top);
         }
+
+        /// <summary>
+        /// Picks a track-space ground point to start an episode at, somewhere in
+        /// the middle of the track rather than at the start line.
+        /// </summary>
+        /// <remarks>
+        /// Candidates are SEGMENT BOUNDARIES, not uniform z. Obstacles are inset by
+        /// <see cref="k_SegmentInset"/> of a segment from each end, so a boundary is
+        /// the one longitudinal position the generator already guarantees is clear
+        /// -- picking uniformly would need a fresh overlap test against every box
+        /// and would sometimes drop the crawler inside a Squeeze wall.
+        ///
+        /// Two rejections on top of that. Gap and Beam segments are excluded on
+        /// either side of the boundary: Gap puts a void mid-segment and Beam has
+        /// floor only under a 1.4-1.7m lane, against a body that splays to 3.9m, so
+        /// a spawn there is a fall the policy never had a chance to avoid. And the
+        /// lane can drift by up to 0.6 x SegmentLength between the two segments the
+        /// body straddles, so x is taken at the midpoint of the two lanes and the
+        /// ground is then re-sampled at +/- half a body length -- an actual
+        /// geometric check rather than an assumption that the lane is clear.
+        ///
+        /// <paramref name="reserveSegments"/> is runway: the caller must leave more
+        /// track ahead than the episode can possibly cover, or the agent runs off
+        /// the end and the "no finish line" framing quietly reintroduces one.
+        /// </remarks>
+        public bool TryPickSpawn(System.Random rng, int reserveSegments, float zJitter,
+                                 out Vector3 groundPoint)
+        {
+            groundPoint = Vector3.zero;
+            // Boundary 0 is the start line and has only the apron behind it; the
+            // last usable boundary leaves `reserveSegments` of runway ahead.
+            int lo = 1;
+            int hi = m_SegmentPattern.Count - Mathf.Max(1, reserveSegments);
+            if (hi < lo) return false;
+
+            for (int attempt = 0; attempt < k_SpawnAttempts; attempt++)
+            {
+                int k = lo + rng.Next(hi - lo + 1);
+                if (IsSpawnBlocked(PatternAt(k)) || IsSpawnBlocked(PatternAt(k - 1))) continue;
+
+                float z = k * SegmentLength;
+                if (zJitter > 0f) z += (float)(rng.NextDouble() * 2.0 - 1.0) * zJitter;
+
+                // Three lateral candidates, because the guaranteed-clear lane can
+                // drift by up to 0.6 x SegmentLength between the two segments the
+                // body straddles -- so their midpoint is not necessarily inside
+                // EITHER corridor, and a Slalom wall runs from the track edge right
+                // up to the lane boundary. Measured over 60k picks, the midpoint
+                // alone failed 12% of the time; trying each lane as well takes that
+                // to zero.
+                float mid = (m_LaneCenter[k] + m_LaneCenter[k - 1]) * 0.5f;
+                for (int c = 0; c < 3; c++)
+                {
+                    float x = c == 0 ? mid : (c == 1 ? m_LaneCenter[k] : m_LaneCenter[k - 1]);
+                    if (!IsSpawnColumnClear(x, z, out float top)) continue;
+                    groundPoint = new Vector3(x, top, z);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Whether a ~3.9m body centred here would rest on continuous ground with
+        /// room to stand up.
+        /// </summary>
+        /// <remarks>
+        /// The three-column test is not belt-and-braces, it is the whole check.
+        /// Every placement in this project is a single point at the body centre,
+        /// while the animal is 3.9m long, so testing only the centre column is what
+        /// puts a quarter of the crawler inside a Slalom wall or under an Overhang.
+        /// The headroom bound is the one that bites: the controller places the body
+        /// centre 1.2m above the surface and MinClearance falls to 1.15m at d=1, so
+        /// a spawn under an overhang starts the episode with the body intersecting
+        /// the slab and the solver ejecting it.
+        /// </remarks>
+        private bool IsSpawnColumnClear(float x, float z, out float top)
+        {
+            if (!GroundHeightAt(x, z, out top)) return false;
+            for (int i = 0; i < 3; i++)
+            {
+                float zz = z + (i - 1) * k_SpawnBodyHalf;
+                if (!GroundHeightAt(x, zz, out float floorTop)) return false;
+                // A step taller than the agent can mount, spanned by its own body,
+                // is a spawn half-buried in a riser.
+                if (Mathf.Abs(floorTop - top) > m_Diff.MaxStep + 1e-3f) return false;
+                if (Headroom(x, zz, floorTop) < k_SpawnHeadroom) return false;
+            }
+            return true;
+        }
+
+        /// <summary>Vertical gap between the walkable surface at a column and the
+        /// lowest obstacle hanging over it. Zero when something rests on the
+        /// surface, which is a wall rather than a ceiling.</summary>
+        private float Headroom(float x, float z, float floorTop)
+        {
+            float ceiling = float.PositiveInfinity;
+            for (int i = 0; i < m_Active.Count; i++)
+            {
+                var b = m_Active[i];
+                if (b.IsFloor) continue;
+                if (x < b.BoundsMin.x || x > b.BoundsMax.x) continue;
+                if (z < b.BoundsMin.z || z > b.BoundsMax.z) continue;
+                if (!b.VerticalSpanAt(x, z, out float bo, out float to)) continue;
+                if (to <= floorTop + 1e-3f) continue;         // buried in the floor
+                if (bo <= floorTop + 0.05f) return 0f;        // rests on it: a wall
+                if (bo < ceiling) ceiling = bo;
+            }
+            return ceiling - floorTop;
+        }
+
+        private static bool IsSpawnBlocked(SegmentPattern p) =>
+            p == SegmentPattern.Gap || p == SegmentPattern.Beam;
 
         /// <summary>Lane centre for the segment containing track-space
         /// <paramref name="z"/>. Respawns use it so the agent restarts on the

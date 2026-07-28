@@ -49,6 +49,9 @@ public static class CrawlerParkourBuilder
     const string BehaviorName = "CrawlerParkour";
 
     const int MaxObstacles = 16;
+    // Mirrors spawn_reserve_segments in config/ppo/CrawlerParkour.yaml, so the
+    // verifier samples the same spawn distribution training will.
+    const int SpawnReserveSegments = 10;
     const int MultiArenaCount = 32;
     const int ArenaGridWidth = 4;
     // Track is 128 long (16 segments x 8) and at most 12 wide. Spacing has to
@@ -293,15 +296,29 @@ public static class CrawlerParkourBuilder
             // Defaults mirror config/ppo/CrawlerParkour.yaml. environment_parameters
             // override them during training; these are what a standalone eval or
             // viewer build runs with.
-            controller.maxEpisodeSteps = 3000;
+            controller.maxEpisodeSteps = 1500;
             controller.fallDepth = 3f;
             controller.difficulty = 0f;
             controller.fixedSeed = -1;
-            controller.progressWeight = 10f;
+            controller.progressPerMeter = 0.08f;
+            controller.velocityPerSecond = 0.0167f;
+            controller.targetSpeed = 2.5f;
             controller.respawnPenalty = 0.5f;
-            controller.finishBonus = 5f;
             controller.energyCostWeight = 0.002f;
             controller.actionRateCostWeight = 0.002f;
+            controller.controlCostFloor = 0.1f;
+            controller.initialLevel = 5;
+            controller.promoteSpeed = 0.5f;
+            controller.demoteSpeed = 0.15f;
+            // Adaptive by default. An eval or viewer build pins the terrain with
+            // --env-param difficulty_pin=<d>, which is the only way a standalone
+            // build (no python side channel) can be made to run the terrain the
+            // training run was actually on.
+            controller.difficultyPin = -1f;
+            controller.spawnReserveSegments = 6;
+            controller.spawnZJitter = 0.5f;
+            controller.spawnYawJitter = 30f;
+            controller.spawnSpeedJitter = 0.5f;
 
             var saved = PrefabUtility.SaveAsPrefabAsset(root, EnvPrefabPath);
             Debug.Log($"Arena prefab -> {EnvPrefabPath}");
@@ -718,30 +735,82 @@ public static class CrawlerParkourBuilder
                 // rest pose, so the crawler is MEANT to have to tuck. Running out of
                 // world in Z is never intended, so the two are counted separately
                 // and only the first fails the build.
+                // Run 006 samples this distribution rather than three fixed poses.
+                // The old version checked spawn (z=1), respawn (z=0.5) and finish
+                // (z = TrackLength - 1) on ONE seed. Two of those are now dead --
+                // there is no finish line, and the spawn is mid-track -- and one
+                // seed was always thin: the finish pose only ever passed because
+                // seed 12345's last segment happened not to be a Gap. Lengthening
+                // the track to 24 segments moved that segment and the check failed
+                // on geometry that was never a defect.
+                //
+                // So: draw real spawns from TryPickSpawn, and real checkpoints from
+                // along the track, over several seeds.
                 foreach (var d in new[] { 0f, 0.25f, 1f })
                 {
-                    track.Generate(12345, d);
-                    var finishZ = track.TrackLength - 1f;
-                    var cases = new[]
+                    float worstSpawnVoid = 0f, worstSpawnSide = 0f;
+                    float worstRespawnVoid = 0f;
+                    int spawns = 0, noSpawn = 0;
+
+                    for (int seed = 0; seed < 8; seed++)
                     {
-                        ("spawn", new Vector2(track.LaneCenterAt(1f), 1f)),
-                        ("respawn", new Vector2(track.LaneCenterAt(0f), 0.5f)),
-                        ("finish", new Vector2(track.LaneCenterAt(finishZ), finishZ)),
-                    };
-                    foreach (var (name, centre) in cases)
-                    {
-                        var (overVoid, overSide) = Footprint(track, controller.agent, centre);
-                        Debug.Log(
-                            $"arena {index} d={d:F2} {name}: {overVoid * 100f:F0}% of the "
-                            + $"footprint over a void, {overSide * 100f:F0}% past the track edge");
-                        if (overVoid > 1e-3f)
+                        track.Generate(12345 + seed, d);
+                        var rng = new System.Random(999 + seed);
+
+                        for (int k = 0; k < 8; k++)
                         {
-                            Debug.LogError(
-                                $"arena {index} d={d:F2}: the crawler {name}s over the end of "
-                                + $"the world -- {overVoid * 100f:F0}% of its footprint has no "
-                                + "ground under it. Extend StartApron/FinishApron.");
-                            ok = false;
+                            if (!track.TryPickSpawn(rng, SpawnReserveSegments, 0.5f, out var p))
+                            {
+                                noSpawn++;
+                                continue;
+                            }
+                            spawns++;
+                            var (v, s) = Footprint(track, controller.agent, new Vector2(p.x, p.z));
+                            worstSpawnVoid = Mathf.Max(worstSpawnVoid, v);
+                            worstSpawnSide = Mathf.Max(worstSpawnSide, s);
                         }
+
+                        // Checkpoint respawns land on a segment boundary + 0.5 on the
+                        // lane, anywhere the agent has reached.
+                        for (int seg = 0; seg < track.BuiltSegments; seg++)
+                        {
+                            float z = seg * track.SegmentLength + 0.5f;
+                            var (v, _) = Footprint(track, controller.agent,
+                                new Vector2(track.LaneCenterAt(z), z));
+                            worstRespawnVoid = Mathf.Max(worstRespawnVoid, v);
+                        }
+                    }
+
+                    Debug.Log(
+                        $"arena {index} d={d:F2}: {spawns} spawns drawn ({noSpawn} unfound), "
+                        + $"worst spawn {worstSpawnVoid * 100f:F0}% over void / "
+                        + $"{worstSpawnSide * 100f:F0}% past the edge; "
+                        + $"worst respawn {worstRespawnVoid * 100f:F0}% over void");
+
+                    if (noSpawn > 0)
+                    {
+                        Debug.LogError($"arena {index} d={d:F2}: {noSpawn} tracks had no usable "
+                            + "spawn -- TryPickSpawn is rejecting everything");
+                        ok = false;
+                    }
+                    if (worstSpawnVoid > 1e-3f)
+                    {
+                        Debug.LogError(
+                            $"arena {index} d={d:F2}: the crawler spawns over the end of the "
+                            + $"world -- {worstSpawnVoid * 100f:F0}% of its footprint has no "
+                            + "ground under it");
+                        ok = false;
+                    }
+                    // A checkpoint respawn is allowed to land somewhere partly
+                    // unsupported -- it returns the agent to ground it has already
+                    // crossed, which may be a beam. A SPAWN is not: the episode
+                    // should not open with a fall the policy had no chance to avoid.
+                    if (worstRespawnVoid > 0.5f)
+                    {
+                        Debug.LogError(
+                            $"arena {index} d={d:F2}: a checkpoint respawn puts "
+                            + $"{worstRespawnVoid * 100f:F0}% of the crawler over a void");
+                        ok = false;
                     }
                 }
             }

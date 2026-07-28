@@ -35,12 +35,27 @@ namespace CrawlerParkour
         public LayerMask GroundMask = ~0;
 
         // Reward weights, pushed in from environment_parameters by the controller.
-        [System.NonSerialized] public float progressWeight = 1f;
+        //
+        // Run 006: every positive term is a RATE -- reward per metre of new ground,
+        // reward per second of good locomotion -- instead of a per-episode budget
+        // divided by TrackLength or MaxDecisions. Both of those denominators were
+        // "finish the track" concepts, and they coupled the reward scale to two
+        // numbers that are now free parameters. Doubling the episode length for run
+        // 005 moved every term by a different factor, which is what made that run's
+        // curriculum thresholds underivable (DESIGN.md 5.2 and 6). As rates,
+        // episode length and track length can both change without rescaling
+        // anything, so a 30s training episode and a 140s eval rollout score on the
+        // same axis.
+        //
+        // Run 005's settings are recovered exactly at progressPerMeter = 10/128 =
+        // 0.078 and velocityPerSecond = 2.0 / 1200 decisions / 0.1 s = 0.0167, so
+        // this is numerically an identity at launch and the warm start is not
+        // shocked by it.
+        [System.NonSerialized] public float progressPerMeter = 0.08f;
         [System.NonSerialized] public float energyCostWeight;
         [System.NonSerialized] public float actionRateCostWeight;
         [System.NonSerialized] public float respawnPenalty;
-        [System.NonSerialized] public float finishBonus = 5f;
-        [System.NonSerialized] public float velocityWeight;
+        [System.NonSerialized] public float velocityPerSecond = 0.0167f;
         [System.NonSerialized] public float targetSpeed = 2.5f;
 
         /// <summary>
@@ -53,18 +68,49 @@ namespace CrawlerParkour
         /// of CollectObservations, and the failure it guards against is quiet:
         /// BehaviorParameters declaring more floats than the agent writes pads the
         /// tail with zeros and trains anyway.
+        ///
+        /// Run 006 retires two of the five track-relative slots (see
+        /// CollectObservations) but keeps WRITING them, as constant zero. Deleting
+        /// them would take this from 42 to 40, change ObservationCount, and make run
+        /// 005's 68M-step checkpoint incompatible on the first layer of the vector
+        /// encoder AND on the running observation normaliser. A constant input is
+        /// just a bias shift that PPO absorbs in a few thousand steps, so the cheap
+        /// version buys the same behaviour for none of the risk. Delete them
+        /// properly at the next architecture change.
         /// </remarks>
         public const int NonGridObservations = 6 + 6 + 1 + 4 + 5 + 20;
 
         /// <summary>Total vector observation size, for BehaviorParameters.</summary>
         public int ObservationCount => NonGridObservations + 2 * GridForward * GridLateral;
 
+        /// <summary>Number of distinct <see cref="SegmentPattern"/> values, for the
+        /// per-pattern traversal counters.</summary>
+        public const int PatternCount = 10;
+
         public float MaxProgress { get; private set; }
         public int RespawnCount { get; private set; }
-        public bool Finished { get; private set; }
         public float EpisodeEnergyCost { get; private set; }
         public float EpisodeActionRateCost { get; private set; }
         public float EpisodeVelocityReward { get; private set; }
+
+        /// <summary>Track-space z the episode started at. Run 006 spawns in the
+        /// middle of the track, so this is no longer ~0 and every distance measure
+        /// has to be taken relative to it.</summary>
+        public float StartZ { get; private set; }
+
+        /// <summary>New ground covered this episode, metres. Replaces
+        /// ProgressFraction: a fraction of a track length only means something when
+        /// there is a track to finish.</summary>
+        public float DistanceCovered => MaxProgress - StartZ;
+
+        /// <summary>Segments the agent entered / fully cleared / fell inside, by
+        /// pattern. Indexed by (int)SegmentPattern. This is the measure that says
+        /// whether the policy is doing parkour or just walking the flat stretches --
+        /// nothing before run 006 distinguished crossing a Gap from crossing a
+        /// Flat, so a single finish rate had to stand in for all ten.</summary>
+        public readonly int[] SegmentsEntered = new int[PatternCount];
+        public readonly int[] SegmentsCleared = new int[PatternCount];
+        public readonly int[] SegmentFalls = new int[PatternCount];
 
         /// <summary>
         /// Mean down-track speed over the episode, m/s. The one number that says
@@ -80,8 +126,14 @@ namespace CrawlerParkour
         private float m_CheckpointZ;
         private Transform[] m_Feet;
         private int m_DecisionPeriod = 1;
+        private float m_DecisionSeconds = 0.02f;
         private float m_ForwardSpeedSum;
         private int m_Decisions;
+        // Highest segment index the agent has ENTERED and the highest it has fully
+        // cleared, so each segment is counted exactly once however many times the
+        // agent crosses back over the boundary after a fall.
+        private int m_EnteredThrough;
+        private int m_ClearedThrough;
 
         public override void Initialize()
         {
@@ -98,9 +150,13 @@ namespace CrawlerParkour
 
             // StepCount counts DECISIONS, while the controller's episode cap counts
             // physics steps -- they differ by this factor. Anything comparing the
-            // two has to divide, which the finish bonus previously did not.
+            // two has to divide, which the run 005 finish bonus previously did not.
             var requester = GetComponent<DecisionRequester>();
             m_DecisionPeriod = requester != null ? Mathf.Max(1, requester.DecisionPeriod) : 1;
+            // Wall-clock seconds one decision covers. This is what turns
+            // velocityPerSecond into a per-decision charge, and it is the only place
+            // the physics tick enters the reward.
+            m_DecisionSeconds = m_DecisionPeriod * Time.fixedDeltaTime;
         }
 
         /// <summary>
@@ -113,14 +169,57 @@ namespace CrawlerParkour
         /// </summary>
         [System.NonSerialized] public Vector3 SpawnPoint;
 
+        /// <summary>Heading offset applied at spawn, degrees about world up.</summary>
+        /// <remarks>
+        /// Run 006. BodyPart.Reset restores an identical recorded pose every
+        /// episode, so before this the policy had never seen a start that was not
+        /// perfectly square to the track -- the only off-axis states it ever
+        /// experienced were the ones it had already fallen into. A policy that is
+        /// supposed to pick up and keep moving from an arbitrary point in an
+        /// arbitrary track needs arbitrary headings in its start distribution.
+        ///
+        /// Deliberately a RIGID rotation of the whole assembly, not per-joint
+        /// jitter. The ConfigurableJoint anchors are computed once in
+        /// SetupBodyPart, and perturbing individual body-part transforms after
+        /// Reset risks popping a joint into a state the solver has to fight out of
+        /// -- which would show up as a mystery spike in early-episode reward rather
+        /// than as an error. A rigid transform of every part is exactly what
+        /// TeleportTo already does for translation and is safe for the same reason.
+        /// </remarks>
+        [System.NonSerialized] public float SpawnYawDegrees;
+
+        /// <summary>Body velocity the episode starts with, world space. Small, and
+        /// nonzero for the same reason as the yaw: standing perfectly still is one
+        /// state out of many the policy has to be able to continue from.</summary>
+        [System.NonSerialized] public Vector3 SpawnVelocity;
+
         public override void OnEpisodeBegin()
         {
             foreach (var bp in m_Jd.bodyPartsDict.Values) bp.Reset(bp);
-            TeleportTo(SpawnPoint);
-            MaxProgress = 0f;
+            PlaceAt(SpawnPoint, SpawnYawDegrees, SpawnVelocity);
+
+            // Run 006 spawns mid-track, so MaxProgress must start at the spawn
+            // rather than at zero. Left at 0 the progress ratchet would pay the
+            // whole distance from the start line to the spawn point on the first
+            // decision -- 0.08 x 40m = 3.2 of free reward, several times a real
+            // episode's total. (This existed in miniature before: spawning at z=1
+            // against MaxProgress 0 paid 0.078 every episode.)
+            StartZ = track != null ? track.ToTrack(SpawnPoint).z : 0f;
+            MaxProgress = StartZ;
             RespawnCount = 0;
-            Finished = false;
-            m_CheckpointZ = 0f;
+            m_CheckpointZ = track != null
+                ? Mathf.Floor(StartZ / track.SegmentLength) * track.SegmentLength : 0f;
+            // The spawn segment is entered part-way through, so it is counted as
+            // NEITHER entered nor cleared -- crediting a clear for the metre of a
+            // Squeeze that happened to be left ahead of the spawn would inflate
+            // exactly the statistic these counters exist to measure honestly. Only
+            // segments met at their own start boundary count.
+            m_EnteredThrough = track != null ? track.SegmentIndexAt(StartZ) : 0;
+            m_ClearedThrough = m_EnteredThrough;
+            System.Array.Clear(SegmentsEntered, 0, PatternCount);
+            System.Array.Clear(SegmentsCleared, 0, PatternCount);
+            System.Array.Clear(SegmentFalls, 0, PatternCount);
+
             m_HasPrevActions = false;
             EpisodeEnergyCost = 0f;
             EpisodeActionRateCost = 0f;
@@ -171,15 +270,23 @@ namespace CrawlerParkour
                 sensor.AddObservation(gc != null && gc.touchingGround);
             }
 
-            // Track-relative situation.
-            float len = track != null ? track.TrackLength : 1f;
+            // Track-relative situation: LATERAL only.
+            //
+            // The last two slots used to be Clamp01(z / TrackLength) and
+            // Clamp01(MaxProgress / TrackLength) -- "how far through the track am
+            // I". That is goal-conditioning on a goal run 006 removes, and with a
+            // mid-track spawn it is worse than useless: it is a feature the policy
+            // can key absolute track position on, which is exactly the dependence
+            // "keep moving at any point in any track" is meant to break. Held at
+            // zero rather than deleted so the observation vector keeps its shape and
+            // run 005's checkpoint stays loadable -- see NonGridObservations.
             float halfW = track != null ? track.TrackWidth * 0.5f : 1f;
             float laneX = track != null ? track.LaneCenterAt(tp.z) : 0f;
             sensor.AddObservation(Mathf.Clamp((tp.x - laneX) / 5f, -2f, 2f));
             sensor.AddObservation(Mathf.Clamp((halfW - tp.x) / 5f, -2f, 2f));
             sensor.AddObservation(Mathf.Clamp((tp.x + halfW) / 5f, -2f, 2f));
-            sensor.AddObservation(Mathf.Clamp01(tp.z / len));
-            sensor.AddObservation(Mathf.Clamp01(MaxProgress / len));
+            sensor.AddObservation(0f);
+            sensor.AddObservation(0f);
 
             AddHeightField(sensor);
 
@@ -268,11 +375,11 @@ namespace CrawlerParkour
         /// is why that run converged on standing still.
         /// </summary>
         /// <remarks>
-        /// The progress ratchet and the finish bonus are the only other positive
-        /// terms and both are conditional on NET forward displacement, while the
-        /// control costs are charged every step. Before a gait exists that pairing
-        /// makes stillness strictly optimal -- the agent pays continuously and earns
-        /// nothing -- and PPO finds that optimum quickly and never leaves.
+        /// The progress ratchet is the only other positive term and it is
+        /// conditional on NET forward displacement, while the control costs are
+        /// charged every step. Before a gait exists that pairing makes stillness
+        /// strictly optimal -- the agent pays continuously and earns nothing -- and
+        /// PPO finds that optimum quickly and never leaves.
         ///
         /// Shape is the stock ML-Agents Crawler's: 1 at target speed, falling to 0
         /// at standstill AND at twice target, so there is nothing to gain by
@@ -281,15 +388,20 @@ namespace CrawlerParkour
         /// nothing, which is the exploit the ratchet was chosen to avoid -- so this
         /// term can be added without giving that exploit back.
         ///
-        /// Divided by MaxDecisions so `velocityWeight` reads as the whole-episode
-        /// budget for perfect locomotion rather than a per-step rate. That keeps it
-        /// commensurable with progressWeight and the finish bonus, which is what
-        /// makes the curriculum thresholds derivable at all.
+        /// SECONDARY by design in run 006, and the reason is the one thing this
+        /// environment wants that stock legged-locomotion setups do not. A
+        /// velocity-tracking term charges the agent for every step it is stopped,
+        /// which prices a deliberate pause to set up a leap as a loss. The
+        /// displacement ratchet is indifferent to WHEN the ground gets covered, so
+        /// it tolerates the tactical slowdown a hard obstacle needs while still
+        /// paying nothing for oscillation. Velocity tracking is primary in
+        /// legged-gym because that work needs a controller that FOLLOWS a commanded
+        /// velocity; we want "as far as possible" instead, and for that the ratchet
+        /// is the better primitive. This term stays as shaping and as the thing that
+        /// pays for facing down-track (the `heading` factor).
         /// </remarks>
         private void ApplyVelocityReward()
         {
-            if (Finished) return;
-
             // Track space differs from world space by a translation only
             // (ToTrack/ToWorld), so a world-space direction is already track-space.
             float vz = AvgVelocity().z;
@@ -298,14 +410,18 @@ namespace CrawlerParkour
 
             // Speed is accounted above this guard, not below it: MeanForwardSpeed is
             // the stat that tells run 002's failure apart from real progress, and an
-            // ablation setting velocity_weight to 0 is exactly when it is needed.
-            if (velocityWeight <= 0f || targetSpeed <= 0f) return;
+            // ablation setting velocity_per_second to 0 is exactly when it is needed.
+            if (velocityPerSecond <= 0f || targetSpeed <= 0f) return;
 
             float d = Mathf.Clamp(Mathf.Abs(vz - targetSpeed), 0f, targetSpeed) / targetSpeed;
             float speed = (1f - d * d) * (1f - d * d);
             float heading = (body.forward.z + 1f) * 0.5f;
 
-            float r = velocityWeight * speed * heading / MaxDecisions;
+            // Per SECOND, charged over the seconds this decision covers -- so the
+            // term is independent of both episode length and decision period. The
+            // old form divided a whole-episode budget by MaxDecisions, which meant
+            // changing the episode cap silently rescaled it.
+            float r = velocityPerSecond * m_DecisionSeconds * speed * heading;
             AddReward(r);
             EpisodeVelocityReward += r;
         }
@@ -336,38 +452,43 @@ namespace CrawlerParkour
         /// </remarks>
         private void ApplyProgressReward()
         {
-            if (Finished || track == null) return;
+            if (track == null) return;
             float z = TrackPos.z;
-            if (z > MaxProgress)
+            if (z <= MaxProgress) return;
+
+            // Per METRE. There is no TrackLength denominator any more, because
+            // there is no track to finish: a fraction-of-track reward would mean
+            // that generating a longer track for a long eval rollout silently
+            // divided the reward, and would make training and eval score on
+            // different axes.
+            AddReward(progressPerMeter * (z - MaxProgress));
+            MaxProgress = z;
+
+            // Checkpoint at each segment boundary cleared.
+            float seg = track.SegmentLength;
+            m_CheckpointZ = Mathf.Floor(MaxProgress / seg) * seg;
+
+            int reached = track.SegmentIndexAt(MaxProgress);
+            while (m_EnteredThrough < reached)
             {
-                AddReward(progressWeight * (z - MaxProgress) / track.TrackLength);
-                MaxProgress = z;
-                // Checkpoint at each segment boundary cleared.
-                float seg = track.SegmentLength;
-                m_CheckpointZ = Mathf.Floor(MaxProgress / seg) * seg;
+                m_EnteredThrough++;
+                SegmentsEntered[(int)track.PatternAt(m_EnteredThrough)]++;
             }
-            if (MaxProgress >= track.TrackLength - 1f)
+            // A segment counts as cleared once the agent is past its FAR boundary,
+            // which is the same thing as having entered the next one. Standing on
+            // top of a hurdle is not clearing it.
+            while (m_ClearedThrough < reached - 1)
             {
-                Finished = true;
-                // Against MaxDecisions, not MaxStepOverride: StepCount counts
-                // decisions and the override counts physics steps, so the old
-                // comparison understated elapsed time by DecisionPeriod (5x) and
-                // left this bonus almost flat -- 5.0 down to 4.5 across a whole
-                // episode. It has to out-vary the dense velocity budget or dawdling
-                // to the finish line pays better than sprinting to it.
-                float timeLeft = 1f - Mathf.Clamp01(StepCount / (float)MaxDecisions);
-                AddReward(finishBonus * (0.5f + 0.5f * timeLeft));
+                m_ClearedThrough++;
+                SegmentsCleared[(int)track.PatternAt(m_ClearedThrough)]++;
             }
         }
 
         /// <summary>Episode length the controller is enforcing, in PHYSICS steps.
-        /// Used to scale the finish bonus so finishing sooner is strictly better.</summary>
-        [System.NonSerialized] public int MaxStepOverride = 3000;
-
-        /// <summary>The same cap expressed in decisions, which is the unit
-        /// <see cref="Agent.StepCount"/> uses and the denominator the dense
-        /// velocity reward is normalised by.</summary>
-        public int MaxDecisions => Mathf.Max(1, MaxStepOverride / m_DecisionPeriod);
+        /// Kept for reporting only -- run 006 has no reward term that depends on
+        /// it, which is what makes the policy episode-length invariant and lets a
+        /// 30s training episode be evaluated over a 140s rollout.</summary>
+        [System.NonSerialized] public int MaxStepOverride = 1500;
 
         private void ApplyControlCosts(ActionSegment<float> c)
         {
@@ -434,6 +555,11 @@ namespace CrawlerParkour
         {
             RespawnCount++;
             AddReward(-respawnPenalty);
+            // Attributed to the segment the agent fell OUT of, which is where it is
+            // now, not the checkpoint it is about to be returned to. Falls charged
+            // to the checkpoint segment would credit every fall to whatever pattern
+            // preceded the hard one.
+            if (track != null) SegmentFalls[(int)track.PatternAt(track.SegmentIndexAt(TrackPos.z))]++;
 
             TeleportTo(CheckpointSpawn());
         }
@@ -463,6 +589,31 @@ namespace CrawlerParkour
                 bp.rb.linearVelocity = Vector3.zero;
                 bp.rb.angularVelocity = Vector3.zero;
                 bp.rb.transform.position += delta;
+            }
+        }
+
+        /// <summary>
+        /// Rigid placement of the whole body at a point and heading, with a given
+        /// starting velocity. Used at episode start; respawns use
+        /// <see cref="TeleportTo"/> instead, because a fall should not also re-square
+        /// the animal to the track.
+        /// </summary>
+        /// <remarks>
+        /// The pivot is read BEFORE the loop: <c>body</c> is itself one of the body
+        /// parts, so reading it inside would rotate the remaining parts about an
+        /// already-moved origin and tear the rig apart.
+        /// </remarks>
+        private void PlaceAt(Vector3 target, float yawDegrees, Vector3 velocity)
+        {
+            var rot = Quaternion.AngleAxis(yawDegrees, Vector3.up);
+            var pivot = body.position;
+            foreach (var bp in m_Jd.bodyPartsDict.Values)
+            {
+                var tr = bp.rb.transform;
+                tr.position = target + rot * (tr.position - pivot);
+                tr.rotation = rot * tr.rotation;
+                bp.rb.linearVelocity = velocity;
+                bp.rb.angularVelocity = Vector3.zero;
             }
         }
     }

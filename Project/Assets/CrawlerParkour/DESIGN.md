@@ -410,6 +410,10 @@ Two corollaries worth stating separately:
 
 ## 6. Curriculum
 
+> **Superseded for run 006 by 8.4.** The ML-Agents lesson ladder described here
+> was replaced by a per-arena terrain level that adapts on measured distance rate.
+> The difficulty scalar and its bounds are unchanged; only what advances it moved.
+
 Difficulty `d` is a single environment parameter driving every bound in §3 by
 interpolation, exposed through the existing `GetParam` plumbing and advanced by
 ML-Agents lessons on mean episode progress. Secondary parameters
@@ -429,3 +433,237 @@ any obstacle reasoning is required.
 - `gamma` 0.995 (long episodes), 32 arenas per env process.
 - Cloud: one Lambda `gpu_1x_a10` at a time, same cadence and budget checkpoint as
   the sumo runs.
+
+---
+
+## 8. Run 006 — no goal, no finish line, no terminal state
+
+Runs 002–005 trained *"cover a 128 m track and cross the line."* Run 006 trains
+*"keep moving forward indefinitely, from any point in any track."*
+
+This is not a reweighting. Five things move together and each is load-bearing for
+the others; changing any one alone makes the environment worse, not better. The
+order below is the dependency order, not the order of importance.
+
+### 8.1 There is no terminal state, so every episode is a truncation
+
+Falling respawns at a checkpoint. The clock truncates. Nothing else ends an
+episode. So `CrawlerParkourEnvController` always calls `Agent.EpisodeInterrupted()`
+and the trainer bootstraps `V(s_T)` — `ppo/trainer.py` L98 gates on
+`done_reached and not interrupted`.
+
+Run 005 called `EndEpisode()` on timeout. That told the trainer a timeout was a
+true terminal, forcing a value target of **0** for roughly **89% of its 55,832
+episodes**, at a step nothing in the observation identifies, from states
+indistinguishable from ones where the agent keeps running. This is the same bug
+CrawlerSumo fixed in `19d19a0ca`, and it is worse here than it was there: sumo's
+mean episode ended at 1306 of 1500 by squeeze, so its cap was rarely reached.
+
+This is Pardo et al.'s case (ii) — the time limit is a training convenience, not
+part of the task — so the fix is to bootstrap, **not** to add remaining-time to the
+observation. The corollary is that no reward term may depend on the clock. Removing
+the finish bonus (§8.3) is the other half of the same fix: its `timeLeft` factor was
+the only place time entered the reward.
+
+### 8.2 Every reward term is a rate
+
+| term | run 005 | run 006 | value |
+|---|---|---|---|
+| progress | `progress_weight × Δz / TrackLength` | `progress_per_meter × Δz` | `10/128 = 0.078125` |
+| velocity | `velocity_weight × shape / MaxDecisions` | `velocity_per_second × shape × dt` | `2.0/120 = 0.0166667` |
+| costs | per decision | per decision | unchanged |
+
+Both old denominators were "finish the track" concepts, and they coupled the reward
+scale to two numbers that are now free parameters. §5.1 documents what that cost:
+doubling the episode length for run 005 moved every term by a different factor, and
+that is what made its curriculum thresholds underivable.
+
+As rates, **episode length and track length can both change without rescaling
+anything** — which is what lets a 30 s training episode and a 140 s eval rollout be
+scored on the same axis. The values above are run 005's numbers to full precision,
+so the re-parameterisation is a numerical identity at launch. Writing `0.08` instead
+of `0.078125` would have been a silent +2.4% bump to the dominant term.
+
+**The ratchet stays primary and velocity stays shaping.** This is a deliberate
+departure from legged-gym-style setups, and the reason is the one thing this
+environment wants that they do not. A velocity-tracking reward charges the agent for
+every step it is stopped, which prices a deliberate pause to set up a leap as a
+loss. The max-so-far displacement ratchet is indifferent to *when* ground gets
+covered, so it tolerates the tactical slowdown a hard obstacle needs while still
+paying nothing for oscillation. Velocity tracking is primary in that literature
+because it needs a controller that *follows a commanded velocity*; we want "as far
+as possible".
+
+### 8.3 Short episodes and a mid-track spawn
+
+`max_episode_steps` **6000 → 1500** (120 s → 30 s), and the agent starts at a random
+segment boundary rather than at z = 1.
+
+Shorter is the right direction once the goal is gone, and the reason is a ratio.
+Run 005 covered 63.5 m of a 128 m track every episode — but always the **same first
+63.5 m**, including 16 m of guaranteed-flat `LeadInSegments`. So about a quarter of
+every trajectory was flat by construction, and the back half of the track was never
+seen at all. What matters is **obstacles per collected timestep, not per episode**,
+and 4× the starts at a uniform sample of the track is what fixes that ratio. Two
+obstacles per episode is also roughly what legged-gym collects (20 s at ~1 m/s over
+8 m tiles).
+
+30 s also sits just past the discount horizon — γ = 0.995 at 0.1 s/decision gives
+1/(1−γ) = 200 decisions = 20 s — which is the regime where bootstrapping at the
+truncation does real work without carrying the whole value estimate.
+
+Spawn placement is `ParkourTrackGenerator.TryPickSpawn`. Segment **boundaries**, not
+uniform z: obstacles are inset 15% of a segment from each end, so a boundary is the
+one longitudinal position the generator already guarantees clear. Gap and Beam are
+excluded on either side. Three lateral candidates are tried (the two lanes and their
+midpoint) because the lane can drift by 0.6 × SegmentLength between the two segments
+the body straddles — the midpoint alone is outside both corridors 12% of the time.
+Each candidate is then re-derived from the placed geometry at ±2 m: ground present,
+step within `MaxStep`, and **headroom ≥ 1.5 m**. That last bound is the one that
+bites — the body centre sits 1.2 m above the surface while `MinClearance` falls to
+1.15 m at d = 1, so a spawn under an Overhang would start the episode with the body
+inside the slab.
+
+Two consequences worth stating explicitly:
+
+- **`MaxProgress` initialises to the spawn z, not 0.** Left at 0 the ratchet pays the
+  whole distance from the start line to the spawn on the first decision — 0.078 ×
+  40 m ≈ 3.1, several times a real episode's total. This existed in miniature
+  before: spawning at z = 1 against `MaxProgress = 0` paid 0.078 every episode.
+- **The spawn segment counts as neither entered nor cleared** in the per-pattern
+  stats (§8.5). It is met part-way through, and crediting a clear for the metre of a
+  Squeeze that happened to be left ahead of the spawn would inflate exactly the
+  statistic those counters exist to measure honestly.
+
+The track grows to **24 segments (192 m)**, forced by the runway requirement. The
+reserve ahead of every spawn is sized against `target_speed`, not against measured
+speed: 2.5 m/s × 30 s = 75 m, so the reserve is 10 segments = 80 m. The policy has
+never exceeded ~0.7 m/s, so 48 m would have been ample in practice — and would have
+become a silent ceiling exactly when the run started working. 16 segments minus a
+10-segment reserve leaves only 6 usable spawn boundaries, which would re-concentrate
+the start distribution near the beginning of the track and undo most of the point;
+24 leaves 14, spread over the first 112 m. Total extent (192 m + two 4 m aprons) sits
+inside the 220 m `ArenaSpacingZ` the 32-arena scene is laid out on.
+
+### 8.4 Per-arena terrain levels replace the reward-threshold ladder
+
+Each arena carries its own integer level in `[0, 10)`, mapping to the same 0..1
+difficulty scalar every bound in §3 is interpolated from. At the end of each episode
+that arena promotes if its measured distance rate ≥ `promote_speed`, demotes if
+< `demote_speed`.
+
+Run 005 is why. It gated the `moderate` lesson at reward 17.0 while the policy scored
+16.04 on **flat**, the easiest terrain in the game — so the gate was above anything it
+could ever reach and the run was lost at launch (§5.2). That failure is structural,
+not a bad number: one global scalar threshold, against a reward whose scale moves
+whenever episode length, track length or any weight moves.
+
+A per-arena level has no threshold to mis-calibrate. It is measured in m/s, a
+physical quantity that does not move when the reward is re-weighted; each arena finds
+its own rung; and the population spreads across the ladder, so the policy keeps
+seeing easy terrain instead of having it taken away. This is Rudin et al.'s
+game-inspired curriculum with distance **rate** in place of raw distance, so the rule
+survives a change of episode length.
+
+Arenas randomise their starting level uniformly up to `initial_level` rather than all
+starting on it. A population in lockstep is what lets one bad promotion strand
+everything at once — precisely what a single global threshold did to run 005 — and a
+spread means speed-vs-level is readable from the first summary window instead of only
+after the ladder has been climbed.
+
+`difficulty_pin ≥ 0` freezes the ladder. **Any rollout used to judge a checkpoint must
+pass `--env-param difficulty_pin=<d>`**, or it is being scored on terrain the training
+run never ran.
+
+### 8.5 Metrics: what replaces finish rate
+
+`Finished`, `FinishSteps` and `ProgressFraction` are gone. A fraction of a track
+length only means something when there is a track to finish.
+
+| stat | why |
+|---|---|
+| `DistanceRate` (m/s) | **headline.** The whole task as one number. Scale-free, so it is comparable across runs 005 and 006 despite the reward change, and across training and eval. |
+| `TerrainLevel` | the curriculum's own progress curve, replacing `Lesson Number`. |
+| `RespawnsPer100m` | the raw count conflates "falls a lot" with "survived long enough to reach anything worth falling off". |
+| `Cleared/<Pattern>`, `Falls/<Pattern>` | per-pattern traversal, 10 of each. |
+
+The per-pattern rates are the measure that says whether the policy is doing parkour
+or walking the flat stretches between obstacles. Nothing before run 006 distinguished
+crossing a `Gap` from crossing a `Flat`; a single finish rate had to stand in for all
+ten. A segment counts as cleared once the agent is past its **far** boundary — standing
+on top of a hurdle is not clearing it — and a fall is charged to the segment the agent
+fell out of, not the checkpoint it is returned to.
+
+Aggregation detail that matters: each stat emits `entered` samples worth
+`count / entered`, so the window mean is the **pooled** rate across every episode and
+arena in the window, rather than an average of per-episode ratios that would weight a
+one-segment episode as heavily as a ten-segment one.
+
+**Report speed conditioned on level, never marginal.** With per-arena levels the
+population always splits by design, so §5.2's corollary about mean forward speed
+applies permanently rather than only after a policy bifurcates.
+
+### 8.6 Considered and rejected
+
+- **Treadmill / infinite recycling track.** Behaviourally identical to a random
+  mid-track spawn once episodes are 30 s — at 2.5 m/s an episode covers 75 m against
+  80 m of reserve, so it cannot reach the end. Segment recycling, seam lane
+  continuity, unbounded-z bookkeeping and box pooling would all be new places for a
+  silent geometry bug, bought for nothing. Revisit only if episodes get long.
+- **Snapshot replay / reference state initialisation.** RSI (DeepMimic) and reverse
+  curricula (Florensa) exist for tasks with a hard exploration bottleneck — a state
+  unreachable by chance. Parkour locomotion is not that; the terrain curriculum
+  already provides graded difficulty. What it would add is a state distribution that
+  is non-stationary *and* coupled to the policy, fighting the `normalize: true`
+  running observation statistics, plus the question of what LSTM hidden state a
+  replayed snapshot has (zeroing it is off-distribution; storing it is real
+  machinery), plus restoring 9 rigidbodies and the exact track seed.
+- **Velocity-command conditioning.** We want maximum distance, not a controller that
+  follows a commanded velocity. See §8.2.
+- **Terminate on fall.** It would make "do not fall" a value-function property rather
+  than a tuned penalty, but it also prices risk so high that the optimal policy is a
+  slow shuffle — the single-mode outcome this environment exists to avoid (§5,
+  risk pricing). The respawn mechanism is not what was broken.
+- **Physics domain randomisation.** Standard for sim-to-real; there is no real robot,
+  so it buys generalisation robustness only. Not now.
+- **Deleting the two goal observations.** `Clamp01(z/len)` and
+  `Clamp01(MaxProgress/len)` are goal-conditioning on a goal that no longer exists,
+  and with a mid-track spawn they let the policy key on absolute track position — so
+  they are **held at constant zero**. Deleting them outright would take
+  `NonGridObservations` from 42 to 40 and make run 005's 68M-step checkpoint
+  incompatible on both the vector encoder's first layer and the running observation
+  normaliser. A constant input is a bias shift PPO absorbs in a few thousand steps.
+  Delete them properly at the next architecture change.
+
+### 8.7 Two traps found while building this
+
+Both were caught by the offline harness (`Tests~`), and both would have been
+invisible in training.
+
+**The three-column spawn check is the whole check, not belt-and-braces.** Every
+placement in this project is a single point at the body centre, while the animal is
+3.9 m long. Testing only the centre column accepted 12% of spawns that put a quarter
+of the crawler inside a Slalom wall or under an Overhang.
+
+**A test grid must be incommensurate with the geometry it samples.** The harness's
+traversability rasteriser used `DZ = 0.4`, so slice centres were `0.4n + 0.2` — while
+a `Gap` at d = 0 has edges at `8k + 3.8` and `8k + 4.2`, both exactly slice centres,
+for every k. Whether each edge read as floor or void came down to float rounding that
+varies with the magnitude of `iz`, so a legal 0.4 m gap rasterised as a 1.2 m one in
+*some* segments, deterministically by position. Lengthening the track from 16 to 24
+segments turned that from invisible into 842 false failures out of 7500. The
+generator was never wrong — its own `VerifyCorridor` reported 0 repairs at d = 0
+throughout. This is exactly the value of §3.2's rule that the two checks be
+independent: when they disagree, one of them is wrong, and which one is a question
+with an answer.
+
+### 8.8 References
+
+- Rudin, Hoeller, Reist, Hutter, *Learning to Walk in Minutes Using Massively
+  Parallel Deep RL*, CoRL 2021 — game-inspired terrain curriculum, 8 m tiles,
+  promote/demote on distance travelled.
+- Pardo, Tavakoli, Levdik, Kormushev, *Time Limits in Reinforcement Learning*,
+  ICML 2018 — partial-episode bootstrapping; case (i) vs case (ii).
+- Zhuang et al., *Robot Parkour Learning*, CoRL 2023 — simple forward-motion reward,
+  no reference motion.
+- Cheng, Shi, Agarwal, Pathak, *Extreme Parkour with Legged Robots*, 2023.

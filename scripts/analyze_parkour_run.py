@@ -1,13 +1,21 @@
 """
-Banded analysis of a staged CrawlerParkour run, plus the reward<->finish-rate fit
-that the curriculum thresholds should be derived from.
+Banded analysis of a CrawlerParkour run.
 
 Usage (unityrl conda env):
   python scripts/analyze_parkour_run.py                       # newest staged run
-  python scripts/analyze_parkour_run.py CrawlerParkour_005
-  python scripts/analyze_parkour_run.py CrawlerParkour_005 --fit-from 4000000
+  python scripts/analyze_parkour_run.py CrawlerParkour_006
+  python scripts/analyze_parkour_run.py CrawlerParkour_006 --bands 4000000
 
-Three things here are easy to get wrong and were all got wrong at least once:
+RUN 006 CHANGED WHAT THIS READS. The environment no longer has a finish line, so
+`Finished`, `FinishSteps` and `ProgressFraction` are gone, and with them the
+reward-vs-finish-rate fit this script used to compute. Runs 002-005 are still
+readable with `--legacy`, which restores the old tag set.
+
+The headline is now `DistanceRate` (m/s of new ground). It is scale-free, so it is
+comparable across runs 005 and 006 despite the reward re-parameterisation, and
+across training (30s episodes) and eval (140s rollouts).
+
+Four things here are easy to get wrong and were all got wrong at least once:
 
 1. ml-agents writes scalars as rank-0 TENSORS. Reading `v.simple_value` returns
    0.0 for every tag, silently, and every number downstream is then a confident
@@ -17,17 +25,16 @@ Three things here are easy to get wrong and were all got wrong at least once:
    written by different code paths at different times, so intersecting step sets
    across tags matches nothing and yields NaN. Every tag is banded on its own.
 
-3. `CrawlerParkour/FinishSteps` is added once per finishing episode and
-   aggregated by AVERAGE, so ml-agents writes one point per summary window. Its
-   sample count is the number of windows containing at least one finish, NOT the
-   number of finishes. The finish count has to come from `Finished` (a windowed
-   mean of a 0/1 per episode) times the episodes closed in that window, which is
-   itself derived from `Environment/Episode Length`.
+3. A single reporting window is noise. Everything printed below is a banded mean
+   and the band is printed with it.
 
-And one thing about reading the output: a single reporting window is noise. At a
-120 s episode a 10k-step window closes only ~8 episodes against a per-episode
-reward std near 1.0. Everything printed below is a banded mean and the band is
-printed with it.
+4. NEW IN 006, and the one most likely to produce a confidently wrong story:
+   every tag is a windowed mean over a population that the per-arena curriculum
+   deliberately SPREADS ACROSS DIFFICULTY LEVELS. So marginal `DistanceRate` moves
+   when the level distribution moves, whether or not the policy improved -- a run
+   whose arenas all get promoted will show FALLING mean speed while getting
+   strictly better. Read `RateAtLevel/*` for anything causal; the marginal is a
+   summary, not evidence. This is DESIGN.md 5.2's corollary made permanent.
 """
 import argparse
 import glob
@@ -44,9 +51,21 @@ STAGING = os.environ.get("UNITYRL_STAGING") or os.path.join(
 BEHAVIOR = "CrawlerParkour"
 WINDOW_STEPS = 10_000          # summary_freq
 PHYS_DT = 0.02
-LESSONS = ["flat", "gentle", "moderate", "hard", "max"]
+LEVELS = 10
 
 TAGS = [
+    ("Environment/Cumulative Reward",     "reward",  3, 1.0),
+    ("CrawlerParkour/DistanceRate",       "m/s",     3, 1.0),
+    ("CrawlerParkour/DistanceCovered",    "metres",  1, 1.0),
+    ("CrawlerParkour/TerrainLevel",       "level",   2, 1.0),
+    ("CrawlerParkour/Difficulty",         "diff",    3, 1.0),
+    ("CrawlerParkour/RespawnsPer100m",    "fall/100m", 2, 1.0),
+    ("CrawlerParkour/MeanForwardSpeed",   "raw m/s", 3, 1.0),
+    ("CrawlerParkour/EnergyCost",         "energy",  3, 1.0),
+    ("Policy/Entropy",                    "entropy", 3, 1.0),
+]
+
+LEGACY_TAGS = [
     ("Environment/Cumulative Reward",   "reward",  3, 1.0),
     ("CrawlerParkour/Finished",         "finish%", 2, 100.0),
     ("CrawlerParkour/MeanForwardSpeed", "m/s",     3, 1.0),
@@ -56,6 +75,9 @@ TAGS = [
     ("CrawlerParkour/EnergyCost",       "energy",  3, 1.0),
     ("Policy/Entropy",                  "entropy", 3, 1.0),
 ]
+
+PATTERNS = ["Flat", "StepField", "Hurdle", "Slalom", "Gap",
+            "Ramp", "Pebbles", "Overhang", "Squeeze", "Beam"]
 
 
 def load(run):
@@ -84,56 +106,25 @@ def band(series, tag, lo, hi):
     return (sum(vals) / len(vals), len(vals)) if vals else (float("nan"), 0)
 
 
-def episode_counts(series):
-    """(episodes, finishes) summed window by window -- see note 3 in the docstring."""
-    el = dict(series.get("Environment/Episode Length", []))
-    fin = dict(series.get("CrawlerParkour/Finished", []))
-    ep = fi = 0.0
-    for step, length in el.items():
-        if length > 0:
-            n = WINDOW_STEPS / length
-            ep += n
-            fi += n * fin.get(step, 0.0)
-    return ep, fi
-
-
-def fit_reward_on_finish(series, start, end, width=2_000_000):
-    """Least squares of banded reward on banded finish rate.
-
-    Bands before `start` are excluded on purpose: while the curriculum is still
-    moving the difficulty is changing under the agent, so those windows are a
-    different environment and would corrupt a fit that is about one lesson.
-    """
-    pts = []
-    lo = start
+def table(s, tags, end, width):
+    print(f"{'band (M)':>14} " + " ".join(f"{lbl:>9}" for _, lbl, _, _ in tags))
+    lo = 0
     while lo < end:
         hi = min(lo + width, end)
-        f, nf = band(series, "CrawlerParkour/Finished", lo, hi)
-        r, nr = band(series, "Environment/Cumulative Reward", lo, hi)
-        if nf and nr:
-            pts.append((f, r))
+        cells = []
+        for tag, _lbl, dp, scale in tags:
+            m, _ = band(s, tag, lo, hi)
+            cells.append(f"{m * scale:9.{dp}f}")
+        print(f"{lo/1e6:6.0f}-{hi/1e6:<7.0f} " + " ".join(cells))
         lo += width
-    if len(pts) < 3:
-        return None
-    n = len(pts)
-    mx = sum(p[0] for p in pts) / n
-    my = sum(p[1] for p in pts) / n
-    sxx = sum((p[0] - mx) ** 2 for p in pts)
-    if sxx == 0:
-        return None
-    b = sum((p[0] - mx) * (p[1] - my) for p in pts) / sxx
-    a = my - b * mx
-    sst = sum((p[1] - my) ** 2 for p in pts)
-    ssr = sum((p[1] - (a + b * p[0])) ** 2 for p in pts)
-    return a, b, (1 - ssr / sst if sst else float("nan")), n, pts
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run", nargs="?", default="")
     ap.add_argument("--bands", type=int, default=4_000_000)
-    ap.add_argument("--fit-from", type=int, default=None,
-                    help="first step of the fit (default: where the last lesson began)")
+    ap.add_argument("--legacy", action="store_true",
+                    help="read the runs 002-005 tag set (finish rate, progress fraction)")
     args = ap.parse_args()
 
     run = args.run
@@ -146,68 +137,57 @@ def main():
 
     s = load(run)
     end = s["Environment/Cumulative Reward"][-1][0]
-    print(f"{run}: {end:,} steps\n")
+    legacy = args.legacy or "CrawlerParkour/DistanceRate" not in s
+    print(f"{run}: {end:,} steps"
+          f"{'   [legacy run 002-005 tag set]' if legacy else ''}\n")
 
-    print("--- curriculum ---")
-    cur, changes = None, []
-    for step, v in s.get("Environment/Lesson Number/difficulty", []):
-        if v != cur:
-            changes.append((step, int(v)))
-            cur = v
-    for step, num in changes:
-        name = LESSONS[num] if num < len(LESSONS) else str(num)
-        print(f"  {step:>12,}  lesson {num} = {name}")
-    last_start = changes[-1][0] if changes else 0
+    if legacy:
+        table(s, LEGACY_TAGS, end, args.bands)
+        print("\nThis run predates the run 006 reframe. Its reward scale, curriculum"
+              "\nand finish metric are not comparable with 006 -- only DistanceRate"
+              "\nis, and this run does not record it. Derive it as"
+              "\n  ProgressFraction x 128m / (Episode Length x 0.1s)")
+        return
 
-    ep, fi = episode_counts(s)
-    nfs = len(s.get("CrawlerParkour/FinishSteps", []))
-    nfin = len(s.get("CrawlerParkour/Finished", []))
-    print(f"\n--- episodes ---")
-    print(f"  episodes  ~{ep:,.0f}")
-    print(f"  finishes  ~{fi:,.0f}  ({100*fi/ep:.2f}%)" if ep else "  finishes  n/a")
-    print(f"  windows containing >=1 finish: {nfs:,} of {nfin:,}"
-          f"   <- NOT the finish count")
+    print(f"--- banded means, {args.bands/1e6:.0f}M-step bands ---")
+    table(s, TAGS, end, args.bands)
 
-    print(f"\n--- banded means, {args.bands/1e6:.0f}M-step bands ---")
-    print(f"{'band (M)':>14} " + " ".join(f"{lbl:>8}" for _, lbl, _, _ in TAGS))
+    # The conditional view. Everything above is marginal over a population the
+    # curriculum deliberately spreads across levels, so a level that gains arenas
+    # can drag the marginal down while every arena in it got faster.
+    print(f"\n--- distance rate BY TERRAIN LEVEL (m/s), {args.bands/1e6:.0f}M bands ---")
+    print("    a level with no samples in a band had no arena on it that window")
+    header = " ".join(f"{('L%d' % i):>7}" for i in range(LEVELS))
+    print(f"{'band (M)':>14} {header}")
     lo = 0
     while lo < end:
         hi = min(lo + args.bands, end)
         cells = []
-        for tag, _lbl, dp, scale in TAGS:
-            m, _ = band(s, tag, lo, hi)
-            cells.append(f"{m*scale:8.{dp}f}")
+        for i in range(LEVELS):
+            m, n = band(s, f"CrawlerParkour/RateAtLevel/{i}", lo, hi)
+            cells.append("      ." if n == 0 else f"{m:7.3f}")
         print(f"{lo/1e6:6.0f}-{hi/1e6:<7.0f} " + " ".join(cells))
         lo += args.bands
 
-    fs = s.get("CrawlerParkour/FinishSteps")
-    if fs:
-        print("\n--- finish time (mean over windows that contained a finish) ---")
-        lo = 0
-        while lo < end:
-            hi = min(lo + 2 * args.bands, end)
-            m, n = band(s, "CrawlerParkour/FinishSteps", lo, hi)
-            if n:
-                print(f"  {lo/1e6:5.0f}-{hi/1e6:<5.0f}M  {m:7.0f} env steps"
-                      f" = {m*PHYS_DT:6.1f} s   (n={n} windows)")
-            lo += 2 * args.bands
+    # Per-pattern clear rate: the measure that says whether this is parkour or
+    # walking the flat stretches. Ordered by final clear rate, hardest last.
+    print(f"\n--- segment clear rate by pattern (%), first vs last {args.bands/1e6:.0f}M ---")
+    print(f"{'pattern':>12} {'first':>8} {'last':>8} {'delta':>8}   {'falls/entry last':>16}")
+    rows = []
+    for p in PATTERNS:
+        f0, n0 = band(s, f"CrawlerParkour/Cleared/{p}", 0, args.bands)
+        f1, n1 = band(s, f"CrawlerParkour/Cleared/{p}", end - args.bands, end)
+        fl, _ = band(s, f"CrawlerParkour/Falls/{p}", end - args.bands, end)
+        if n0 == 0 and n1 == 0:
+            continue
+        rows.append((f1, p, f0, f1, fl))
+    for _, p, f0, f1, fl in sorted(rows, reverse=True):
+        print(f"{p:>12} {100*f0:8.1f} {100*f1:8.1f} {100*(f1-f0):+8.1f}   {fl:16.3f}")
 
-    start = args.fit_from if args.fit_from is not None else last_start
-    got = fit_reward_on_finish(s, start, end)
-    if got:
-        a, b, r2, n, _pts = got
-        print(f"\n--- reward vs finish rate, {n} bands from {start/1e6:.0f}M ---")
-        print(f"  R = {a:.3f} + {b:.3f} * finish_rate      R^2 = {r2:.4f}")
-        print(f"  stalling episode  ~{a:.2f}")
-        print(f"  finishing episode ~{a+b:.2f}  (EXTRAPOLATED past the data --"
-              f" cross-check against the reward model at the observed finish time)")
-        print("\n  a reward threshold is really a finish-rate demand:")
-        for thr in (8.0, 9.5, 12.0, 17.0, 18.0):
-            need = (thr - a) / b
-            flag = "  <-- above 100%, unreachable" if need > 1 else ""
-            print(f"    R >= {thr:5.1f}  ->  finish rate {100*need:6.1f}%{flag}")
-        f_now, _ = band(s, "CrawlerParkour/Finished", end - 4_000_000, end)
-        print(f"\n  this run reached {100*f_now:.1f}% over its last 4M steps.")
+    lvl, _ = band(s, "CrawlerParkour/TerrainLevel", end - args.bands, end)
+    rate, _ = band(s, "CrawlerParkour/DistanceRate", end - args.bands, end)
+    print(f"\nlast {args.bands/1e6:.0f}M: mean level {lvl:.2f} of {LEVELS-1},"
+          f" {rate:.3f} m/s marginal")
 
 
 if __name__ == "__main__":
