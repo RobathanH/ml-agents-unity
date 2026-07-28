@@ -380,6 +380,15 @@ nowhere to advance to. The rung below it, 9.5, demanded only ~30% — so the lad
 jumped from "cover ground without finishing" straight to "finish almost always",
 with nothing in between.
 
+The cheapest check is blunter than any of that, and it would have caught run 005
+before launch: **what does the threshold score on the lesson BELOW it?** Run 005
+spent its first 140k steps on `flat` -- difficulty 0.0, the easiest lesson that
+exists -- finishing 83.6% of episodes for a mean reward of **16.04**. The gate
+guarding `moderate` was 17.0. The threshold was above what that policy scored
+while finishing five episodes in six on flat ground, so no amount of training at
+d=0.5 could ever have cleared it. A gate higher than the rung below it is a
+ceiling, and the run is lost at launch.
+
 **Derive thresholds through the mixture, and state each one as the finish rate it
 demands before committing to it.** `scripts/analyze_parkour_run.py` fits the two
 coefficients from a finished run and prints that conversion for a ladder of
