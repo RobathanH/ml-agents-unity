@@ -356,6 +356,47 @@ curriculum threshold.** `scripts/reward005.py` is that derivation; it reproduces
 the shipped run 003 table to within 0.02 before computing anything new, which is
 what makes its new numbers trustworthy.
 
+### 5.2 A threshold is a demand on the DISTRIBUTION, not on one gait
+
+Run 005 stalled on lesson `moderate` for 67.9M of its 68.2M steps, and the cause
+was in the threshold, not the policy. `moderate`'s 17.0 was derived by computing
+what **one** episode finishing at 1.2 m/s would score (17.28) and setting the bar
+just under it. That silently assumes essentially every episode finishes.
+
+What the trainer actually averages is a mixture. Once finishing is reachable but
+not reliable, the episode population is bimodal — some episodes complete, the
+rest stall — and the mean reward is
+
+    R = R_stall + (R_finish - R_stall) * f
+
+for finish rate `f`. Run 005 measured both ends directly: regressing banded
+reward on banded finish rate over 33 x 2M bands at fixed difficulty gives
+`R = 3.37 + 19.58 f` with **R^2 = 0.95**. Reward at a fixed lesson is the finish
+rate and very little else.
+
+Inverted, that says what a threshold really demands. 17.0 was asking for **two
+thirds to four fifths of all episodes to finish**; run 005 reached 10.6% and had
+nowhere to advance to. The rung below it, 9.5, demanded only ~30% — so the ladder
+jumped from "cover ground without finishing" straight to "finish almost always",
+with nothing in between.
+
+**Derive thresholds through the mixture, and state each one as the finish rate it
+demands before committing to it.** `scripts/analyze_parkour_run.py` fits the two
+coefficients from a finished run and prints that conversion for a ladder of
+candidate thresholds; a threshold whose demanded finish rate is not reachable
+from where the run starts is a wall, not a lesson.
+
+Two corollaries worth stating separately:
+
+- **Calibrate each lesson's baseline AT that lesson.** Run 005's `flat` threshold
+  came from run 004's 0.638 m/s, measured at d=0.5 on obstacle terrain. On
+  near-flat ground the same policy is far faster, so `flat` and `gentle` were both
+  cleared on the `min_lesson_length` episode counter without gating anything.
+- **Mean forward speed is not a progress measure once the population splits.**
+  Run 005's fell from run 004's 0.653 to 0.529 m/s while progress rose from 0.334
+  to 0.496 and finishes went from 1 to ~4,390: the mean is dominated by the
+  stalled majority. Track the finish rate.
+
 ---
 
 ## 6. Curriculum
