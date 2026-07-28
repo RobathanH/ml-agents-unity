@@ -42,7 +42,28 @@ param(
     # Launch even if this project already has a live instance. Off by default:
     # the standing guardrail is one instance PER PROJECT.
     [switch]$AllowConcurrent,
-    [switch]$Resume
+    [switch]$Resume,
+    # Warm start: seed this run's weights from a PREVIOUS run's final checkpoint.
+    # Takes a staged run-id (e.g. CrawlerParkour_005). The checkpoint is uploaded
+    # from results/cloud_staging/<run>/<behavior>/checkpoint.pt to the matching
+    # path under ~/ml-agents/results/ on the instance, which is where
+    # mlagents-learn's --initialize-from looks (settings.py resolves it as
+    # results_dir/<run>).
+    #
+    # NOT the same as -Resume, and the difference matters. Resume continues the
+    # SAME run-id with its optimiser state, step counter and schedules intact.
+    # This takes only the weights, resets the step counter to zero, and starts
+    # fresh schedules -- which is the right tool when the environment or the
+    # reward has changed underneath the policy, as in run 005 -> 006. ml-agents
+    # errors if both are set, so they are refused here rather than there.
+    #
+    # Observation and action shapes must still match or the state dict will not
+    # load. Zeroing a retired observation slot instead of deleting it keeps that
+    # true; changing hidden_units, the memory size or the EGNN geometry does not.
+    [string]$InitializeFrom = "",
+    # Behaviour subdirectory holding checkpoint.pt. Defaults to the project tag,
+    # which is the behaviour name for every project here.
+    [string]$InitBehavior = ""
 )
 # NOTE: "Continue" not "Stop" -- in PowerShell 5.1 any native-command stderr
 # (e.g. ssh host-key notices) becomes a NativeCommandError that would kill the
@@ -172,8 +193,26 @@ Invoke-Ssh $ip "tar -xzf ~/build.tgz -C ~/ml-agents/envs/ && rm ~/build.tgz"
 # umask scoped in a subshell: leaking it into the session poisons tmux socket perms
 Invoke-Ssh $ip "(umask 177 && echo '$ApiKey' > ~/.lambda_api_key)"
 
+# --- 7b. Warm start: upload the seed checkpoint ---
+if ($InitializeFrom) {
+    if ($Resume) {
+        throw "-Resume and -InitializeFrom are mutually exclusive: resume continues the same run, initialize-from seeds a new one from another run's weights."
+    }
+    $behavior = if ($InitBehavior) { $InitBehavior } else { $Project }
+    $ckpt = Join-Path $PSScriptRoot "..\..\results\cloud_staging\$InitializeFrom\$behavior\checkpoint.pt"
+    if (-not (Test-Path $ckpt)) {
+        throw "-InitializeFrom $InitializeFrom : no checkpoint at $ckpt. Pull it first with scripts\pull_checkpoints.ps1."
+    }
+    $sizeMB = [math]::Round((Get-Item $ckpt).Length / 1MB, 1)
+    Write-Host "Warm start: uploading $InitializeFrom/$behavior/checkpoint.pt ($sizeMB MB)..."
+    Invoke-Ssh $ip "mkdir -p ~/ml-agents/results/$InitializeFrom/$behavior"
+    scp -q -i $KeyFile -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 `
+        $ckpt "ubuntu@${ip}:~/ml-agents/results/$InitializeFrom/$behavior/checkpoint.pt"
+    if ($LASTEXITCODE -ne 0) { throw "scp of the warm-start checkpoint failed (instance is RUNNING: $instanceId at $ip)" }
+}
+
 # --- 8. Start training + watchdog ---
-$extra = if ($Resume) { "--resume" } else { "" }
+$extra = if ($Resume) { "--resume" } elseif ($InitializeFrom) { "--initialize-from=$InitializeFrom" } else { "" }
 # Paths are relative to the repo on the instance; expand them there.
 $envPrefix = ""
 if ($Config) { $envPrefix += "CONFIG=`$HOME/ml-agents/$Config " }
@@ -187,6 +226,7 @@ $killTime = (Get-Date).AddMinutes($limitMin)
 Write-Host ""
 Write-Host "=== Training started ==="
 Write-Host "  run-id:        $RunId  ($NumEnvs env processes x 12 arenas)"
+if ($InitializeFrom) { Write-Host "  warm start:    weights from $InitializeFrom (step counter reset to 0)" }
 Write-Host "  instance:      $instanceId ($InstanceType, $region, `$$price/hr)"
 Write-Host "  ip:            $ip"
 Write-Host "  training stops:   $($stopTime.ToString('HH:mm'))  (graceful, final checkpoint exported)"
