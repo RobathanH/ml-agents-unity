@@ -80,21 +80,61 @@ PATTERNS = ["Flat", "StepField", "Hurdle", "Slalom", "Gap",
             "Ramp", "Pebbles", "Overhang", "Squeeze", "Beam"]
 
 
-def load(run):
+def read_events(path):
+    """One events file: its series, and the wall-clock span it covers."""
+    series, w0, w1 = {}, None, None
+    for ev in EventFileLoader(path).Load():
+        if ev.wall_time:
+            w0 = w0 or ev.wall_time
+            w1 = ev.wall_time
+        for v in ev.summary.value:
+            if v.tensor.float_val:
+                series.setdefault(v.tag, []).append(
+                    (ev.step, float(v.tensor.float_val[0])))
+    for t in series:
+        series[t].sort()
+    return series, (w1 - w0) / 3600.0 if w0 and w1 else 0.0
+
+
+def load(run, merge=False):
+    """
+    Series for a run, from ONE events file unless told otherwise.
+
+    Merging every events file in the directory is the obvious implementation and
+    it is wrong. A restarted run leaves several, each beginning at step 0, so a
+    merge interleaves two different policies onto one step axis and every banded
+    mean near the start silently blends them. Run 006 hit exactly this: a 0.15 h
+    cold start was killed and replaced by an 11 h warm-started run, and both
+    events files were synced. Default is therefore the LONGEST-RUNNING file, with
+    the others named so the choice is visible rather than assumed.
+    """
     d = os.path.join(STAGING, run, BEHAVIOR)
     files = sorted(glob.glob(os.path.join(d, "events.out.tfevents.*")))
     if not files:
         sys.exit(f"no events files under {d}")
-    series = {}
-    for path in files:
-        for ev in EventFileLoader(path).Load():
-            for v in ev.summary.value:
-                if v.tensor.float_val:
-                    series.setdefault(v.tag, []).append(
-                        (ev.step, float(v.tensor.float_val[0])))
-    for t in series:
-        series[t].sort()
-    return series
+    if len(files) == 1:
+        return read_events(files[0])[0]
+
+    parts = []
+    for p in files:
+        s, hours = read_events(p)
+        steps = max((x[0] for pts in s.values() for x in pts), default=0)
+        parts.append((hours, steps, p, s))
+    parts.sort()
+    print(f"NOTE: {len(files)} events files in {run} -- a restarted run.")
+    for hours, steps, p, _ in parts:
+        print(f"      {os.path.basename(p)}: {hours:5.2f} h, max step {steps:,}")
+    if merge:
+        print("      MERGING them (--merge): step axes overlap, read with care.")
+        out = {}
+        for _, _, _, s in parts:
+            for t, pts in s.items():
+                out.setdefault(t, []).extend(pts)
+        for t in out:
+            out[t].sort()
+        return out
+    print(f"      using the longest: {os.path.basename(parts[-1][2])}")
+    return parts[-1][3]
 
 
 def band(series, tag, lo, hi):
@@ -125,6 +165,9 @@ def main():
     ap.add_argument("--bands", type=int, default=4_000_000)
     ap.add_argument("--legacy", action="store_true",
                     help="read the runs 002-005 tag set (finish rate, progress fraction)")
+    ap.add_argument("--merge", action="store_true",
+                    help="merge all events files of a restarted run instead of using "
+                         "the longest one (step axes will overlap)")
     args = ap.parse_args()
 
     run = args.run
@@ -135,7 +178,7 @@ def main():
             sys.exit(f"no staged {BEHAVIOR} runs under {STAGING}")
         run = os.path.basename(max(cands, key=os.path.getmtime))
 
-    s = load(run)
+    s = load(run, merge=args.merge)
     end = s["Environment/Cumulative Reward"][-1][0]
     legacy = args.legacy or "CrawlerParkour/DistanceRate" not in s
     print(f"{run}: {end:,} steps"
