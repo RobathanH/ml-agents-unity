@@ -52,6 +52,10 @@ EVAL_ONLY = {"fixed_seed"}
 # interpolation, so the joined key never appears as a literal -- look for the parts.
 PRESENT = [
     "EpisodeInterrupted",
+    # The run 006 reset bug: spawn and respawn wrote every nested part's world
+    # transform in a loop and tore the rig apart. MoveRig transforms only the root.
+    # Absent here means the binary still has the broken reset.
+    "MoveRig", "is not a descendant of",
     "TryPickSpawn", "SpawnYawDegrees", "spawn_reserve_segments", "spawn_yaw_jitter",
     "progress_per_meter", "velocity_per_second",
     "difficulty_pin", "initial_level", "promote_speed", "demote_speed",
