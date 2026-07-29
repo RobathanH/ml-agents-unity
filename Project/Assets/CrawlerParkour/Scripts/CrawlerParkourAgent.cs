@@ -157,6 +157,25 @@ namespace CrawlerParkour
             // velocityPerSecond into a per-decision charge, and it is the only place
             // the physics tick enters the reward.
             m_DecisionSeconds = m_DecisionPeriod * Time.fixedDeltaTime;
+
+            // MoveRig moves the rig by transforming ONLY `body`, which is exact
+            // precisely because every other part hangs off it in the prefab
+            // hierarchy. If that stops being true, the legs silently stop following
+            // the body on every spawn and respawn -- the agent would be placed with
+            // its limbs left behind at the previous position, which reads as a
+            // mysteriously terrible policy rather than as a broken reset. Checked
+            // once here rather than trusted.
+            foreach (var t in new[] { leg0Upper, leg0Lower, leg1Upper, leg1Lower,
+                                      leg2Upper, leg2Lower, leg3Upper, leg3Lower })
+            {
+                if (t != null && !t.IsChildOf(body))
+                {
+                    Debug.LogError(
+                        $"{name}: body part '{t.name}' is not a descendant of '{body.name}'. "
+                        + "MoveRig transforms only the root and relies on the hierarchy to "
+                        + "carry the rest; re-parenting breaks every spawn and respawn.");
+                }
+            }
         }
 
         /// <summary>
@@ -583,13 +602,7 @@ namespace CrawlerParkour
         /// </summary>
         private void TeleportTo(Vector3 target)
         {
-            var delta = target - body.position;
-            foreach (var bp in m_Jd.bodyPartsDict.Values)
-            {
-                bp.rb.linearVelocity = Vector3.zero;
-                bp.rb.angularVelocity = Vector3.zero;
-                bp.rb.transform.position += delta;
-            }
+            MoveRig(target, 0f, Vector3.zero);
         }
 
         /// <summary>
@@ -598,20 +611,56 @@ namespace CrawlerParkour
         /// <see cref="TeleportTo"/> instead, because a fall should not also re-square
         /// the animal to the track.
         /// </summary>
-        /// <remarks>
-        /// The pivot is read BEFORE the loop: <c>body</c> is itself one of the body
-        /// parts, so reading it inside would rotate the remaining parts about an
-        /// already-moved origin and tear the rig apart.
-        /// </remarks>
         private void PlaceAt(Vector3 target, float yawDegrees, Vector3 velocity)
         {
-            var rot = Quaternion.AngleAxis(yawDegrees, Vector3.up);
-            var pivot = body.position;
+            MoveRig(target, yawDegrees, velocity);
+        }
+
+        /// <summary>
+        /// Moves the whole crawler to a world position and heading, rigidly, by
+        /// transforming ONLY the root body.
+        /// </summary>
+        /// <remarks>
+        /// THE PARTS ARE NESTED, and this is the whole reason this method exists.
+        /// The prefab hierarchy is Body -> legN -> forelegN, so every one of the
+        /// other eight parts is a descendant of <c>body</c>. `transform.position`
+        /// and `transform.rotation` are WORLD values derived through the parent
+        /// chain, so writing Body's already moves all eight descendants with it.
+        ///
+        /// Both this and the respawn path used to loop over every part writing
+        /// `tr.position = target + rot * (tr.position - pivot)`. That reads a value
+        /// a previous write in the same loop had already displaced, so the offset
+        /// landed twice on a leg and three times on a foreleg:
+        ///
+        ///     Body      P + delta
+        ///     legN      P + 2*delta
+        ///     forelegN  P + 3*delta
+        ///
+        /// At a mid-track spawn `delta` is the distance from the recorded rest pose
+        /// to the spawn point -- up to ~112m on a 24-segment track. The rig was
+        /// therefore torn tens of metres apart on every episode reset, the
+        /// ConfigurableJoints were violated by that much, and the solver answered
+        /// with an enormous corrective impulse: the crawler was launched off the
+        /// track spinning, respawned, and launched again. The yaw rotation
+        /// compounded the same way.
+        ///
+        /// Moving only the root is exact rather than approximately right: every
+        /// relative transform, and therefore every joint constraint, is preserved
+        /// by construction, and there is no read-after-write to get wrong. It also
+        /// makes TeleportTo actually do what its comment always claimed -- preserve
+        /// the pose a fall left the agent in.
+        /// </remarks>
+        private void MoveRig(Vector3 target, float yawDegrees, Vector3 velocity)
+        {
+            if (yawDegrees != 0f)
+            {
+                // About Body's own pivot, so this changes heading without moving it.
+                body.rotation = Quaternion.AngleAxis(yawDegrees, Vector3.up) * body.rotation;
+            }
+            body.position = target;
+
             foreach (var bp in m_Jd.bodyPartsDict.Values)
             {
-                var tr = bp.rb.transform;
-                tr.position = target + rot * (tr.position - pivot);
-                tr.rotation = rot * tr.rotation;
                 bp.rb.linearVelocity = velocity;
                 bp.rb.angularVelocity = Vector3.zero;
             }
