@@ -667,3 +667,62 @@ with an answer.
 - Zhuang et al., *Robot Parkour Learning*, CoRL 2023 — simple forward-motion reward,
   no reference motion.
 - Cheng, Shi, Agarwal, Pathak, *Extreme Parkour with Legged Robots*, 2023.
+
+### 8.9 What run 006 measured, and the check that was still missing
+
+Run 006 delivered every mechanism in §8 and still produced no learning. The
+mechanisms were not the problem; the curriculum's calibration was.
+
+**The result.** Terrain level went from 2.71 to 8.91 of 9 within 1.1M steps — 4% of
+the run — and stayed there. After that, distance rate at level 9 was flat for 23M
+steps: least-squares slope +0.0015 m/s per 1M steps at R² = 0.0008, a total change
+of +0.036 m/s against a window-to-window standard deviation of 0.366. Per-pattern
+clear rates did not move, and `Squeeze`, `Overhang` and `Hurdle` went backwards.
+
+**The cause.** `promote_speed` was 0.50 m/s, calibrated against run 005's final
+policy, which managed 0.548 m/s at difficulty 0.5. But run 006 was warm-started, and
+the warm-started policy did **1.085 m/s** in its first 200k steps. A promote gate
+below the starting policy's rate is not a curriculum — it is a one-way ratchet to the
+ceiling. `demote_speed` at 0.15 was never approached, so nothing came back down.
+
+**§5.2's check has a mirror image, and it is the one that was missing.** §5.2 records
+the cheap pre-launch question that would have caught run 005: *what does this
+threshold score on the lesson below it?* — a guard against a gate set too **high**. It
+has an opposite that guards against a gate set too **low**:
+
+> **What does the policy you are starting from already score?** If it clears the
+> promote gate at every rung, the curriculum is a no-op by construction, and the run
+> is lost at launch just as surely as run 005 was. One eval rollout of the starting
+> checkpoint answers it.
+
+Both questions are the same question — *is the gate inside the reachable band?* — asked
+from the two sides. Run 005 missed the top edge, run 006 the bottom.
+
+**And a structural point beneath both.** A single global `promote_speed` assumes one
+distance rate is equally demanding at every difficulty. It is not: 0.5 m/s is trivial
+on flat and hard at 0.99. So no single value can hold a population in the middle of
+the ladder — whatever rate is chosen is either below the policy everywhere (ratchets
+up) or above it everywhere (strands). The gate has to scale per rung, set from a
+*measured* rate-vs-difficulty curve of the starting policy rather than from one
+number. This is the same lesson as §5.2's "a threshold is a demand on the
+DISTRIBUTION", one level up: with an adaptive per-arena curriculum the threshold is a
+demand on the *rung*, and it has to be expressed per rung.
+
+**Two operational findings from the same run.**
+
+`Beam` draws 2.72 falls per segment entered against a median of 0.55 for every other
+pattern — roughly 5× worse. It has floor only under a 1.7 m lane with void either
+side, against a body that splays to 3.9 m. At difficulty 0.99 the agent falls off it
+repeatedly inside one segment, and it is a candidate for having consumed the whole
+run's error budget. Either fix it or drop it from the mix until the rest works.
+
+Throughput measured **686 steps/s**, not the ~300 estimated from the first few
+reporting windows — env startup sits inside that first window and makes it useless as
+a rate estimate. Worth remembering before re-deriving `max_steps` from early output.
+
+**Data loss.** The scheduled artifact sync stopped 11.06 h into a 23.75 h run, so only
+the first 27.31M steps of an estimated 58.6M survive, and there is no final
+checkpoint — the instance terminated on schedule and took the rest with it. Checkpoints
+exist only on the instance until synced (§ management README), and a sync that fails
+silently is indistinguishable from one that is up to date. The report covers what
+survived and says so.
