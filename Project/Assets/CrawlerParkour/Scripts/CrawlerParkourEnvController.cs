@@ -109,23 +109,35 @@ namespace CrawlerParkour
         /// (ratchets up) or above it at every rung (strands). The gate has to be
         /// expressed per rung -- DESIGN 8.9.
         ///
-        /// These come from run 007's final policy, measured over its last 4M steps:
-        /// L6 0.834, L7 0.667, L8 0.613, L9 0.537 m/s. Levels 0-5 have no final-policy
-        /// measurement, because once the ratchet turned no arena went back down there,
-        /// so the curve below L6 is the least-squares extrapolation of those four points
-        /// (1.3715 - 0.0945*L). That extrapolation is the weakest part of this and it is
-        /// self-correcting: with per-rung gates the population spreads, so the next run
-        /// produces RateAtLevel data at every rung and the curve can be replaced with
-        /// measurement.
+        /// RUN 008 VALUES, measured under run 008 physics. Doubling joint strength and
+        /// ground friction changes what a rung costs, so the run 007 curve had to be
+        /// thrown away: keeping it would have put every gate ~11% below what the policy
+        /// does and re-created the ratchet through a change that had nothing to do with
+        /// the curriculum. The curve is a property of the TERRAIN AND THE PHYSICS
+        /// together -- re-derive it whenever either moves.
         ///
-        /// The curve is deliberately a property of the ENVIRONMENT, not of a checkpoint:
-        /// it says "this is what this terrain costs", so the same numbers stay meaningful
-        /// when the policy changes. Re-derive it only when the terrain generator changes.
+        /// Measured by running run 007's final checkpoint at each pinned difficulty
+        /// through the viewer's --measure-seconds mode: 9 episodes per rung, 90 total.
+        /// See scripts/check_curriculum_gates.py for the gate that consumes it.
+        ///
+        /// The ten raw points are FITTED, not used directly. Nine episodes per rung is
+        /// thin -- the raw L3 came back above the raw L2, which the terrain cannot
+        /// support, since difficulty is one scalar every obstacle bound interpolates
+        /// from. A raw non-monotone curve puts a wall at one rung and a hole at the
+        /// next, and arenas pile up under the wall. The linear fit pools all 90 episodes
+        /// into two parameters (1.2419 - 0.0870*L, R2 0.736) and is clamped monotone.
+        ///
+        /// For reference, the run 007 curve was
+        /// {1.372, 1.277, 1.183, 1.088, 0.994, 0.899, 0.834, 0.667, 0.613, 0.537};
+        /// the new one is a near-uniform 0.90x of it. The warm-started policy is SLOWER
+        /// under the stiffer joints because it was trained against the old gains, and it
+        /// re-adapts during training -- which is the reason the gate is a fraction of
+        /// this curve rather than an absolute speed.
         /// </remarks>
         public static readonly float[] ReferenceRate =
         {
-            1.372f, 1.277f, 1.183f, 1.088f, 0.994f,
-            0.899f, 0.834f, 0.667f, 0.613f, 0.537f,
+            1.242f, 1.155f, 1.068f, 0.981f, 0.894f,
+            0.807f, 0.720f, 0.633f, 0.546f, 0.459f,
         };
 
         private int m_Steps;

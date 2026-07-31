@@ -99,11 +99,87 @@ public class ParkourRolloutViewer : MonoBehaviour
 
         SetUpCamera();
 
+        var measure = GetArg("--measure-seconds");
+        if (measure != null)
+        {
+            // Calibration is CPU-bound, not wall-clock-bound: fixedDeltaTime is
+            // untouched, so raising the time scale runs the same physics steps sooner
+            // and changes nothing about the rate being measured. If the CPU cannot
+            // keep up Unity simply falls behind, which costs time and not accuracy.
+            var ts = GetArg("--time-scale");
+            if (ts != null) { Time.timeScale = float.Parse(ts); }
+            StartCoroutine(MeasureLoop(float.Parse(measure)));
+            return;
+        }
+
         if (!string.IsNullOrEmpty(m_CaptureDir))
         {
             Directory.CreateDirectory(m_CaptureDir);
             StartCoroutine(CaptureLoop());
         }
+    }
+
+    /// <summary>
+    /// Run without capturing and report the distance rate this policy achieves on the
+    /// pinned terrain. Exists to calibrate CrawlerParkourEnvController.ReferenceRate.
+    /// </summary>
+    /// <remarks>
+    /// The promote/demote gates are fractions of a reference rate-vs-difficulty curve,
+    /// and that curve is a property of the PHYSICS as much as of the terrain. Run 008
+    /// doubled joint strength and ground friction, which invalidates a curve measured
+    /// under run 007's physics: a policy that now covers ground faster clears a stale
+    /// gate every episode, and the ladder ratchets to the ceiling exactly as it did in
+    /// runs 006 and 007.
+    ///
+    /// Capturing frames is not needed to measure a rate and costs ~50x the wall clock,
+    /// so this path skips the camera work entirely. Timescale is left alone: the
+    /// physics step is what the rate is defined against.
+    ///
+    /// Reports the mean over whole episodes only. A partial episode at the cutoff has a
+    /// distance but not its full clock, and averaging it in biases the rate upward.
+    /// </remarks>
+    System.Collections.IEnumerator MeasureLoop(float seconds)
+    {
+        yield return new WaitForSeconds(1.0f);
+        var agents = FindObjectsByType<CrawlerParkourAgent>(FindObjectsSortMode.None);
+        if (agents.Length == 0)
+        {
+            Debug.LogError("ParkourRolloutViewer: no CrawlerParkourAgent to measure");
+            Application.Quit(2);
+            yield break;
+        }
+
+        var lastEpisode = new int[agents.Length];
+        var lastDistance = new float[agents.Length];
+        double sum = 0;
+        int episodes = 0;
+        float t0 = Time.time;
+
+        while (Time.time - t0 < seconds)
+        {
+            for (int i = 0; i < agents.Length; i++)
+            {
+                int ep = agents[i].CompletedEpisodes;
+                if (ep != lastEpisode[i])
+                {
+                    // The episode that just ended covered whatever distance was
+                    // standing before the reset zeroed it.
+                    if (lastEpisode[i] > 0)
+                    {
+                        sum += lastDistance[i];
+                        episodes++;
+                    }
+                    lastEpisode[i] = ep;
+                }
+                lastDistance[i] = agents[i].DistanceCovered;
+            }
+            yield return new WaitForSeconds(0.1f);
+        }
+
+        float mean = episodes > 0 ? (float)(sum / episodes) : 0f;
+        Debug.Log($"ParkourRolloutViewer: MEASURE episodes={episodes} " +
+                  $"meanDistance={mean:F4} agents={agents.Length}");
+        Application.Quit(0);
     }
 
     /// <summary>

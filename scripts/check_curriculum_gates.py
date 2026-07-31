@@ -19,6 +19,7 @@ Run with no arguments to check the fractions currently in the yaml against run 0
 measured distributions. Pass a promote and demote fraction to try others.
 """
 import glob
+import json
 import os
 import re
 import sys
@@ -83,6 +84,25 @@ df = float(sys.argv[2]) if len(sys.argv) > 2 else float(ep["demote_fraction"])
 
 ref = reference_curve()
 samples, end = rate_samples()
+
+# Optional third argument: a JSON file holding the PREVIOUS reference curve under
+# {"old": [...]}. Whenever the physics changes, the per-episode spreads recorded by
+# an earlier run describe the old dynamics, and using them raw would validate the new
+# gates against a distribution that no longer exists.
+#
+# Each level's samples are rescaled by ref[L] / old[L] -- i.e. the shape of the spread
+# is carried over and only its centre is moved. That assumes the coefficient of
+# variation is a property of the task and of episode noise rather than of joint gains,
+# which is an ASSUMPTION and is stated as one. It is far better than checking against
+# the wrong centre outright, and run 008 is what replaces it with measurement.
+if len(sys.argv) > 3:
+    prev = json.load(open(sys.argv[3]))["old"]
+    for L in range(LEVELS):
+        if prev[L] > 0:
+            k = ref[L] / prev[L]
+            samples[L] = [v * k for v in samples[L]]
+    print(f"note  spreads rescaled from the previous curve by ref/old per level "
+          f"(shape kept, centre moved)\n")
 print(f"run 007 final {TAIL/1e6:.0f}M steps (to {end:,}), "
       f"promote_fraction {pf}, demote_fraction {df}\n")
 print(f"{'level':6}{'ref':>8}{'promote':>9}{'demote':>8}{'n':>7}"

@@ -154,6 +154,23 @@ public static class CrawlerParkourBuilder
     /// cosmetic choice -- a slippier one makes the hardest ramps unclimbable and
     /// the generator has no way to detect it.
     /// </summary>
+    /// <summary>
+    /// Ground and obstacle friction. Run 008 doubled this from 0.8.
+    /// </summary>
+    /// <remarks>
+    /// The crawler's own colliders carry no physics material, so Unity pairs this
+    /// with the project default (0.6) and FrictionCombine is Average -- the CONTACT
+    /// coefficient is therefore (1.6 + 0.6) / 2 = 1.1, up from 0.7, not 1.6. Doubling
+    /// the material doubles the material; it does not double the contact. Assign this
+    /// material to the crawler's foot colliders, or switch the combine mode, if the
+    /// full factor is wanted.
+    ///
+    /// Kept here as a named constant because it lives in two places -- this builder
+    /// and the checked-in .physicMaterial asset -- and a rebuild silently overwrites
+    /// the asset with whatever this says.
+    /// </remarks>
+    const float GroundFriction = 1.6f;
+
     static PhysicsMaterial EnsurePhysicsMaterial()
     {
         // The class was renamed in Unity 6 but the asset extension this editor
@@ -167,8 +184,8 @@ public static class CrawlerParkourBuilder
             var existing = AssetDatabase.LoadAssetAtPath<PhysicsMaterial>(path);
             if (existing != null)
             {
-                existing.dynamicFriction = 0.8f;
-                existing.staticFriction = 0.8f;
+                existing.dynamicFriction = GroundFriction;
+                existing.staticFriction = GroundFriction;
                 existing.bounciness = 0f;
                 EditorUtility.SetDirty(existing);
                 return existing;
@@ -176,8 +193,8 @@ public static class CrawlerParkourBuilder
 
             var mat = new PhysicsMaterial("ParkourGround")
             {
-                dynamicFriction = 0.8f,
-                staticFriction = 0.8f,
+                dynamicFriction = GroundFriction,
+                staticFriction = GroundFriction,
                 bounciness = 0f,
             };
             try

@@ -204,6 +204,40 @@ if ($InitializeFrom) {
         throw "-InitializeFrom $InitializeFrom : no checkpoint at $ckpt. Pull it first with scripts\pull_checkpoints.ps1."
     }
     $sizeMB = [math]::Round((Get-Item $ckpt).Length / 1MB, 1)
+
+    # REPORT THE STEP COUNT, AND REFUSE IF IT IS BEHIND THE RUN'S OWN CHECKPOINTS.
+    #
+    # checkpoint.pt is rewritten in place by the trainer, so a sync that copies by
+    # mtime+size can leave a stale one behind indefinitely. Run 007's staged copy sat
+    # at 499,800 steps while the numbered checkpoints beside it reached 66,759,900 --
+    # warm starting from it would have seeded run 008 from a policy 133x less trained
+    # than intended, silently, and the physics change under test would have taken the
+    # blame. Nothing about the file's name, size or date says which one it is.
+    $stepScript = @'
+import sys, torch
+d = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+gs = d["global_step"]
+print(int(list(gs.values())[0] if hasattr(gs, "values") else gs))
+'@
+    $tmp = Join-Path $env:TEMP "ckpt_step.py"
+    Set-Content -Path $tmp -Value $stepScript -Encoding ascii
+    $seedStep = 0
+    try { $seedStep = [int](& python $tmp $ckpt 2>$null) } catch { $seedStep = 0 }
+    if ($seedStep -gt 0) {
+        $numbered = Get-ChildItem (Split-Path $ckpt) -Filter "$behavior-*.pt" -ErrorAction SilentlyContinue |
+            ForEach-Object { [int]($_.BaseName -replace '.*-', '') } | Sort-Object
+        $newest = if ($numbered) { $numbered[-1] } else { 0 }
+        Write-Host ("Warm start seed: {0:N0} steps" -f $seedStep) -NoNewline
+        if ($newest -gt 0) { Write-Host ("  (newest numbered checkpoint beside it: {0:N0})" -f $newest) }
+        else { Write-Host "" }
+        if ($newest -gt $seedStep * 1.5) {
+            throw ("checkpoint.pt is STALE: it holds {0:N0} steps but {1}-{2}.pt sits beside it. " -f $seedStep, $behavior, $newest) +
+                  "The sync left an old in-place file behind. Copy the newest numbered checkpoint over checkpoint.pt and relaunch."
+        }
+    } else {
+        Write-Host "Warm start seed: step count unreadable (torch missing?) -- NOT verified" -ForegroundColor Yellow
+    }
+
     Write-Host "Warm start: uploading $InitializeFrom/$behavior/checkpoint.pt ($sizeMB MB)..."
     Invoke-Ssh $ip "mkdir -p ~/ml-agents/results/$InitializeFrom/$behavior"
     scp -q -i $KeyFile -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 `

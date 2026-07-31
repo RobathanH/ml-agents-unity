@@ -971,3 +971,73 @@ infrastructure failure not happening. The sync should fail loudly.
 Throughput measured **862 steps/s** for run 007 against run 006's 686 on the same
 hardware and config; the difference is the broken build's respawn storm. `max_steps` for
 a 24 h run is therefore ~74.5M, and run 008 books 74M.
+
+## 10. Run 008 — stronger joints, more grip, and what that costs the curriculum
+
+Run 008 doubles the actuation and the grip, warm-starting from run 007's final
+checkpoint:
+
+| | run 007 | run 008 |
+|---|---|---|
+| `maxJointSpring` | 40000 | 80000 |
+| `jointDampen` | 5000 | 10000 |
+| `maxJointForceLimit` | 20000 | 40000 |
+| ground friction | 0.8 | 1.6 |
+
+Both target §9.5: `Beam` is a balance failure and `Gap` needs power the rig may not
+have. More authority and more grip is the cheapest thing to try before redesigning
+either obstacle.
+
+**The friction number is not the contact number.** The crawler's own colliders carry no
+physics material, so Unity pairs `ParkourGround` with the project default (0.6), and
+`FrictionCombine` is Average — the contact coefficient goes 0.7 → **1.1**, not 0.8 →
+1.6. Doubling the material doubles the material. Assign the material to the foot
+colliders, or switch the combine mode, if the full factor is ever wanted.
+
+Friction also lived in **two** hardcoded places — the checked-in `.physicMaterial` asset
+and `CrawlerParkourBuilder`, which silently overwrites the asset on any rebuild. It is
+now one named constant, `GroundFriction`.
+
+### 10.1 A physics change invalidates the curriculum calibration
+
+This is the trap, and it is not obvious: `ReferenceRate` (§9.4) is a measured curve, and
+what it measures is the terrain **and the physics together**. Doubling the joints made
+run 007's curve wrong by ~11%, which would have put every gate below what the policy
+does and re-created the run 006/007 ratchet — through a change that had nothing to do
+with the curriculum at all.
+
+So the curve was re-measured rather than reasoned about. `ParkourRolloutViewer` gained a
+`--measure-seconds` mode that runs the environment headless at a pinned difficulty and
+reports the mean distance per completed episode; run 007's final checkpoint was run at
+all ten rungs under run 008 physics, 9 episodes each, 90 total.
+
+The result is a near-uniform **0.90× of the run 007 curve**. The warm-started policy is
+*slower* under stiffer joints, because it was trained against the old gains and its
+learned actions produce different torques at double the stiffness. It re-adapts during
+training — which is precisely why the gate is a fraction of a curve rather than an
+absolute speed, and why the first few million steps of run 008 are expected to look
+worse before they look better.
+
+The ten raw points are **fitted, not used raw**. Nine episodes per rung is thin, and the
+raw L3 came back above the raw L2 — impossible, since difficulty is one scalar every
+obstacle bound interpolates from. A non-monotone reference curve puts a wall at one rung
+and a hole at the next and arenas pile up under the wall. The linear fit pools all 90
+episodes into two parameters (`1.2419 - 0.0870*L`, R² 0.736) and is clamped monotone.
+
+**Rule: re-run the calibration whenever the physics, the rig or the generator changes.**
+A curve is not a constant.
+
+### 10.2 checkpoint.pt can be stale, and nothing about it says so
+
+`-InitializeFrom` seeds a run from `results/cloud_staging/<run>/<behavior>/checkpoint.pt`.
+Run 007's staged copy held **499,800** steps while the numbered checkpoints beside it
+reached **66,759,900** — the trainer rewrites `checkpoint.pt` in place, and a sync that
+copies on size-and-mtime can skip it indefinitely.
+
+Warm starting run 008 from it would have seeded from a policy 133× less trained than
+intended, silently, and the physics change under test would have taken the blame. Name,
+size and date all look correct; only the tensor inside says otherwise.
+
+`cloud_train.ps1` now reads the seed's `global_step`, prints it, and **refuses to launch**
+if it is far behind the newest numbered checkpoint sitting in the same directory. Same
+shape as §9.6: the invariant was being trusted, and now it is checked.

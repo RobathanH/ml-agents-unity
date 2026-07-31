@@ -3076,9 +3076,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 1b29724baddfa457da6eeab446fa49ca, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  maxJointSpring: 40000
-  jointDampen: 5000
-  maxJointForceLimit: 20000
+  maxJointSpring: 80000
+  jointDampen: 10000
+  maxJointForceLimit: 40000
   bodyPartsList: []
 --- !u!114 &6281156746766132230
 MonoBehaviour:
