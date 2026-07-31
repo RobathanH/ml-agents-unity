@@ -251,8 +251,32 @@ $extra = if ($Resume) { "--resume" } elseif ($InitializeFrom) { "--initialize-fr
 $envPrefix = ""
 if ($Config) { $envPrefix += "CONFIG=`$HOME/ml-agents/$Config " }
 if ($EnvBin) { $envPrefix += "ENV_BIN=`$HOME/ml-agents/$EnvBin " }
-Invoke-Ssh $ip "$envPrefix bash ml-agents/scripts/lambda/launch_training.sh $RunId $NumEnvs $extra"
 $limitMin = [int]([math]::Round($TimeLimitHours * 60))
+
+# ARM THE WATCHDOG EVEN IF TRAINING FAILS TO START.
+#
+# Everything from here on runs on a BILLING instance. A launch that dies between
+# instance creation and watchdog arming leaves an instance with no bound on it at
+# all: that happened once for 12h25m and ~$16, and again on run 008's first attempt,
+# where -Branch defaulted to another project's branch so the config was not on the
+# box and launch_training.sh exited 1. The instance was already running and paid for.
+#
+# The watchdog is happy to be armed against a box with no trainer on it -- it notes
+# the trainer is absent and still terminates at the same wall-clock limit, so arming
+# it on the failure path costs nothing and bounds the loss at the limit instead of at
+# whenever someone notices.
+try {
+    Invoke-Ssh $ip "$envPrefix bash ml-agents/scripts/lambda/launch_training.sh $RunId $NumEnvs $extra"
+} catch {
+    Write-Host "Training failed to start -- arming the watchdog anyway so this instance is bounded." -ForegroundColor Yellow
+    try {
+        Invoke-Ssh $ip "tmux kill-session -t train 2>/dev/null; tmux new-session -d -s train -n watchdog 'bash ~/ml-agents/scripts/lambda/watchdog.sh $instanceId $limitMin $GraceMinutes 2>&1 | tee -a ~/watchdog.log'"
+        Write-Host "Watchdog armed: $instanceId terminates in $limitMin min. Fix the cause and relaunch, or terminate now." -ForegroundColor Yellow
+    } catch {
+        Write-Host "COULD NOT ARM THE WATCHDOG. TERMINATE $instanceId BY HAND NOW." -ForegroundColor Red
+    }
+    throw
+}
 Invoke-Ssh $ip "tmux new-window -t train -n watchdog 'bash ~/ml-agents/scripts/lambda/watchdog.sh $instanceId $limitMin $GraceMinutes 2>&1 | tee -a ~/watchdog.log'"
 
 $stopTime = (Get-Date).AddMinutes($limitMin - $GraceMinutes)
