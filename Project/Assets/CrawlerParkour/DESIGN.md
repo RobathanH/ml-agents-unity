@@ -726,3 +726,248 @@ checkpoint — the instance terminated on schedule and took the rest with it. Ch
 exist only on the instance until synced (§ management README), and a sync that fails
 silently is indistinguishable from one that is up to date. The report covers what
 survived and says so.
+
+> **Superseded in part by §9.** The cause given above — the promote gate sitting below
+> the starting policy's rate — did happen and §9.3 keeps it. It is **not** why run 006
+> failed. Run 006's episode reset was tearing the crawler's rig apart, and the 1.085 m/s
+> "starting policy rate" that this section reasons from was itself a product of that bug.
+> §9 replaces the causal claim; the structural argument at the end of this section is
+> what survives, and §9.4 acts on it.
+
+## 9. Run 007 — the reset fix, and what the environment actually measures
+
+Run 007 re-ran run 006 with one thing changed. Same config, same warm start from
+`CrawlerParkour_005`, same instance type. The diff between the two launch commits is
+two files: `CrawlerParkourAgent.cs`, and `preflight_parkour.py`, which is a check script
+and is not shipped. `CrawlerParkourEnvController.cs` — which computes every statistic
+either run reports — is byte-identical across the two. That is what makes the comparison
+below a controlled one rather than a pair of anecdotes.
+
+66.75M steps in 21.5 h at 862 steps/s, stopped with SIGINT so the trainer exported its
+final ONNX. $27.73.
+
+### 9.1 The bug: a rigid move that was not rigid
+
+The prefab hierarchy is `Body → legN → forelegN`. Every one of the other eight parts is
+a **descendant** of `body`, and `transform.position`/`rotation` are world values derived
+through the parent chain — so writing Body's already moves all eight with it.
+
+Both the spawn path (`PlaceAt`) and the respawn path (`TeleportTo`) looped over every
+part writing `tr.position = target + rot * (tr.position - pivot)`. That reads a value a
+previous write in the same loop has already displaced, so the offset landed twice on a
+leg and three times on a foreleg:
+
+```
+Body      P + delta
+legN      P + 2*delta
+forelegN  P + 3*delta
+```
+
+`delta` is the distance from the recorded rest pose to the placement. At a mid-track
+spawn on a 24-segment track that is up to ~112 m. The ConfigurableJoints were violated
+by that much on every reset and the solver answered with an enormous corrective impulse:
+the crawler was launched off the track spinning, respawned, and launched again.
+
+**Why it hid for five runs.** `TeleportTo` carried the defect from the day the
+environment was written, but a respawn moves the agent a few metres, and a rig stretched
+by a few metres looks like ordinary contact noise. §8.3's mid-track spawn multiplied the
+same defect by roughly fifty. The bug did not appear in run 006 — run 006 is where it
+became large enough to see.
+
+It was found by a human watching the rollout videos and asking whether the odd starting
+angle was a capture artefact. Nothing in 27M steps of metrics said "broken reset"; the
+metrics said "bad policy", which is what a broken reset looks like from the outside.
+
+### 9.2 Run 006's headline number was not locomotion
+
+Over the 4M steps both runs cover, run 006 reports **0.844 m/s** of progress and run 007
+**0.469** — so on the face of it the broken build was better. It was not, and the reason
+matters more than the number.
+
+`DistanceCovered` is `MaxProgress - StartZ`: a monotone high-water mark of z. Any impulse
+that throws the agent **down** the track is banked as progress and never given back. Four
+tests, all over the shared band:
+
+| test | run 006 | run 007 |
+|---|---|---|
+| distance rate ÷ mean forward speed | **5.97×** | **1.09×** |
+| corr(respawns, distance rate) | **+0.364** | −0.033 |
+| metres of progress per respawn | 13.3 | 170.1 |
+| clear-rate spread across the 10 patterns | 14.4 pts | 93.9 pts |
+
+The first is decisive on its own. Distance rate and mean forward speed are measured
+independently — net displacement over episode seconds, versus the average of the body's
+actual forward velocity — and for honest locomotion they track each other. Run 006 banked
+six metres of progress for every metre it walked.
+
+The second is a **sign flip**, not a magnitude difference: within run 006, windows with
+more respawns show *more* distance. Falling paid. A difference in policy skill cannot
+produce that.
+
+The fourth needs no statistics. Run 006 cleared every obstacle type at roughly the same
+rate — 57.9% to 72.3% across ten patterns ranging from bare flat ground to a hole in the
+floor. Run 007's span 0.0% to 93.9%. A policy that finds a Gap exactly as easy as flat
+ground is not solving either one.
+
+**The general lesson: a monotone high-water-mark metric cannot distinguish locomotion
+from displacement.** It was chosen (§8.2) because it is scale-free and immune to
+backtracking, and those properties still hold. But it needs a companion that no impulse
+can fake. `MeanForwardSpeed` was already being recorded and already contained the answer;
+nobody had thought to compare the two. **Any run whose rate/speed ratio is far from 1 is
+reporting something other than walking.**
+
+### 9.3 What run 007 measured
+
+The marginal distance rate barely moves — 0.463 m/s over the first 4M against 0.563 over
+the last — because the terrain gets harder at the same time. Conditioned on rung, it
+moves a lot:
+
+| quarter | rate @ L7 | rate @ L8 | rate @ L9 | entropy |
+|---|---|---|---|---|
+| Q1 | 0.467 | 0.378 | 0.297 | 0.974 |
+| Q2 | 0.573 | 0.501 | 0.395 | 0.717 |
+| Q3 | 0.642 | 0.585 | 0.484 | 0.479 |
+| Q4 | 0.651 | 0.611 | 0.526 | 0.312 |
+
+**+77% at maximum difficulty on terrain that did not change.** Least squares past 4M:
++0.0045 m/s per 1M at R² 0.47 over 6,233 windows; run 006's same fit was +0.0015 at
+R² 0.0008. Entropy fell monotonically at R² 0.985 where run 006's rose. The critic's
+value estimate went from −0.185 (against a *positive* mean reward, which is only
+consistent with returns it could not predict) to +0.141.
+
+It is flattening: the tail-20M fit is +0.0027 at R² 0.04, and Q4 added only 0.042 m/s.
+Entropy at 0.31 means exploration is nearly spent. This configuration has given most of
+what it has.
+
+Run 007 is the first run of this environment whose numbers describe the policy rather
+than the physics solver. Nothing before it should be read as a measurement of a reward
+or a curriculum.
+
+### 9.4 The gate has to be a fraction, and now is
+
+§8.9 argued that a single global `promote_speed` cannot be right at every rung. Run 007
+proved it a second way. Both runs used 0.5 m/s; both pinned to the ceiling. What changed
+was only *how fast*:
+
+| terrain level first reached | run 006 | run 007 |
+|---|---|---|
+| 8.0 | 1.0M steps | 16.4M steps |
+| 8.5 | 1.2M steps | 33.8M steps |
+
+**Sixteen times slower** — because the fix removed the free ballistic distance that was
+pushing every arena past the gate on its first episodes. The curriculum in run 006 was
+not responding to skill at all. But it still saturated in run 007, because 0.5 m/s is
+below what the policy does at every rung it reached (L6 0.834, L7 0.667, L8 0.613,
+L9 0.537 over the last 4M).
+
+Run 008 replaces the absolute gate with a fraction of a per-rung reference curve:
+
+```
+promote = promote_fraction * ReferenceRate[level]
+demote  = demote_fraction  * ReferenceRate[level]
+```
+
+`ReferenceRate` lives in `CrawlerParkourEnvController` and is a property of the
+**terrain**, not of a checkpoint: it says what this rung costs. Levels 6–9 are run 007's
+measurement; 0–5 are the least-squares extrapolation of those four points, because once
+the ratchet turned no arena went back down there and no final-policy measurement exists.
+
+**The fractions were nearly wrong in a new way, and the check caught it.** The obvious
+pair is `promote_fraction: 1.0` — beat what the last policy did on this terrain — with a
+wide demote band, per §8.4's warning about oscillation. Run against run 007's actual
+per-episode spread, that pair gives, at level 8:
+
+```
+p(promote) 0.46    p(demote) 0.03    -> 18x upward bias
+```
+
+Which is a ratchet. Slower and better-motivated than 0.5 m/s, but the same failure.
+**A gate at the median of a distribution promotes half the time and demotes almost
+never.** Mean-versus-threshold reasoning cannot see this; only the spread can.
+
+`scripts/check_curriculum_gates.py` computes p(up), p(down) and p(stay) per rung from
+`RateAtLevel`, and fails when any rung below the ceiling is more than 3:1 one-way. It
+selected **1.15 / 0.85**:
+
+| rung | p(up) | p(down) | stay |
+|---|---|---|---|
+| L6 | 0.35 | 0.49 | 0.16 |
+| L7 | 0.33 | 0.42 | 0.25 |
+| L8 | 0.26 | 0.28 | 0.47 |
+| L9 | 0.16 | 0.16 | 0.68 |
+
+An arena holds its rung most episodes, the population spreads instead of collecting at
+one end, and climbing requires the policy to genuinely get 15% better. §8.4's oscillation
+worry was about noise-driven thrash; what it should have said is that thrash at the
+*individual* arena is how a *population* holds a spread, and the thing to control is the
+bias of the walk, not its step rate.
+
+**Run this before every launch.** It is the cheap check §5.2 has now been re-learned
+three times for: run 005's gate was above anything reachable, runs 006 and 007's below
+anything the policy could fail, and run 008's first draft was a ratchet in disguise.
+
+That extrapolation is the weakest part of this, and it is **self-correcting**: with
+per-rung gates the population spreads across the ladder, so run 008 produces
+`RateAtLevel` data at every rung and the curve can be replaced with measurement. The
+per-rung gate does not just fix the curriculum — it fixes the reason the curriculum could
+not be calibrated.
+
+`promote_speed`/`demote_speed` are kept and used whenever `promote_fraction` is not
+positive, so runs 006 and 007 remain reproducible from their own configs. A config that
+silently means something different than it did when it ran destroys the comparison the
+run existed to make.
+
+`CrawlerParkour/PromoteGate` and `RateMinusGate` are now recorded, so "did the curriculum
+have anything to say" is one chart rather than an archaeology exercise against the config.
+
+### 9.5 Two obstacles the policy cannot do
+
+**Gap: 0.0%.** Not poor — never, across 66.75M steps, and it was already 0.4% in the
+first 4M. It does not fall in either (0.010 falls per entry): it stops at the edge and
+the episode times out. The crawler has no jump and nothing in a rate-based reward pushes
+a quadruped to leave the ground. Either add an explicit air-phase term or drop the
+pattern; leaving it in means paying for episodes that stall.
+
+**Beam: 6.2% cleared, 0.61 falls per entry** — eighteen times the next worst pattern
+(Hurdle, 0.034), and one of only two that got worse over the run. §8.9 flagged it and it
+survived the reset fix, so it is not a symptom of the bug. Before treating it as a
+learning problem, check whether the beam the generator produces at high difficulty is
+traversable by this rig at all: the offline harness proves a *corridor* exists, it does
+not check that a body which splays to 3.9 m can balance along a 1.7 m lane with void
+either side.
+
+Everything else improved: Overhang 54.3 → 76.1%, Slalom 32.5 → 49.2%, Squeeze 18.9 →
+26.3%, StepField 68.6 → 75.4%, Flat 91.1 → 92.4%.
+
+### 9.6 The check that was missing, and now exists
+
+Every pre-launch check run 006 had was on **geometry** — that generated tracks are
+traversable, that spawn points have clear ground and headroom — and none was on the
+**agent arriving there intact**. Preflight even verified that the reset code's symbols
+were present in the shipped binary; it could not verify that the code was right.
+
+`CrawlerParkourAgent.AssertRigIntact` now snapshots every part's **body-local** position
+immediately before a rigid move and compares immediately after. A rigid move must not
+change any part's position relative to the body; if one moves more than 2 cm, it logs
+once and says in the message that no distance or fall metric from that run can be
+trusted.
+
+Body-local rather than world offsets is what makes this correct for `TeleportTo` too: a
+respawn deliberately preserves whatever pose the fall left, so the offsets differ episode
+to episode, and only their **invariance across the move** is the actual contract.
+
+The general form of this, worth applying beyond the reset: *every invariant that is
+enforced by construction should be asserted anyway, at the place it is constructed.* The
+comment above `MoveRig` correctly explains why moving only the root is exact. Comments do
+not fail a build.
+
+### 9.7 Infrastructure
+
+Run 007's artifact sync ran cleanly for the whole run, but it was checked by hand
+mid-run — nothing would have alerted us if it had stopped, and §8.9 records what that
+cost run 006. Two consecutive runs have now had their result depend on a silent
+infrastructure failure not happening. The sync should fail loudly.
+
+Throughput measured **862 steps/s** for run 007 against run 006's 686 on the same
+hardware and config; the difference is the broken build's respawn storm. `max_steps` for
+a 24 h run is therefore ~74.5M, and run 008 books 74M.

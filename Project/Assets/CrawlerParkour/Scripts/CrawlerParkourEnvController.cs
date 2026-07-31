@@ -55,10 +55,21 @@ namespace CrawlerParkour
         [Tooltip("Level this arena starts at, 0..Levels-1. Arenas randomise up to "
             + "this so the population covers a spread from step 1.")]
         public int initialLevel = 5;
-        [Tooltip("Distance rate (m/s) at or above which this arena moves up a level.")]
+        [Tooltip("Distance rate (m/s) at or above which this arena moves up a level. "
+            + "Only used when promoteFraction is not positive; see UpdateTerrainLevel.")]
         public float promoteSpeed = 0.5f;
-        [Tooltip("Distance rate (m/s) below which this arena moves down a level.")]
+        [Tooltip("Distance rate (m/s) below which this arena moves down a level. "
+            + "Only used when promoteFraction is not positive.")]
         public float demoteSpeed = 0.15f;
+        [Tooltip("Promote when the arena beats this fraction of ReferenceRate at its "
+            + "CURRENT level. Positive enables per-rung gates; zero or below falls "
+            + "back to the flat promoteSpeed/demoteSpeed pair.")]
+        public float promoteFraction = -1f;
+        [Tooltip("Demote below this fraction of ReferenceRate at the current level. "
+            + "Set from the measured spread by scripts/check_curriculum_gates.py, not "
+            + "by eye -- a gate at the median promotes half the time and demotes "
+            + "almost never, which is a ratchet however it was derived.")]
+        public float demoteFraction = 0.85f;
         [Tooltip("Negative: adapt. Zero or above: pin difficulty here and freeze the "
             + "curriculum. Eval builds use this.")]
         public float difficultyPin = -1f;
@@ -85,6 +96,37 @@ namespace CrawlerParkour
         /// run 005's five named lessons, not a different axis.
         /// </summary>
         public const int Levels = 10;
+
+        /// <summary>
+        /// Distance rate (m/s) a competent policy achieves at each rung. The promote
+        /// and demote gates are FRACTIONS of this, not absolute speeds.
+        /// </summary>
+        /// <remarks>
+        /// Run 006 and run 007 both used one global promote_speed of 0.5 m/s, and both
+        /// ratcheted every arena to the ceiling, because 0.5 m/s is trivial on flat and
+        /// hard at difficulty 1.0. No single number can hold a population in the middle
+        /// of a ladder: whatever value is chosen is either below the policy at every rung
+        /// (ratchets up) or above it at every rung (strands). The gate has to be
+        /// expressed per rung -- DESIGN 8.9.
+        ///
+        /// These come from run 007's final policy, measured over its last 4M steps:
+        /// L6 0.834, L7 0.667, L8 0.613, L9 0.537 m/s. Levels 0-5 have no final-policy
+        /// measurement, because once the ratchet turned no arena went back down there,
+        /// so the curve below L6 is the least-squares extrapolation of those four points
+        /// (1.3715 - 0.0945*L). That extrapolation is the weakest part of this and it is
+        /// self-correcting: with per-rung gates the population spreads, so the next run
+        /// produces RateAtLevel data at every rung and the curve can be replaced with
+        /// measurement.
+        ///
+        /// The curve is deliberately a property of the ENVIRONMENT, not of a checkpoint:
+        /// it says "this is what this terrain costs", so the same numbers stay meaningful
+        /// when the policy changes. Re-derive it only when the terrain generator changes.
+        /// </remarks>
+        public static readonly float[] ReferenceRate =
+        {
+            1.372f, 1.277f, 1.183f, 1.088f, 0.994f,
+            0.899f, 0.834f, 0.667f, 0.613f, 0.537f,
+        };
 
         private int m_Steps;
         private int m_EpisodeIndex;
@@ -219,6 +261,8 @@ namespace CrawlerParkour
             initialLevel = Mathf.RoundToInt(GetParam("initial_level", initialLevel));
             promoteSpeed = GetParam("promote_speed", promoteSpeed);
             demoteSpeed = GetParam("demote_speed", demoteSpeed);
+            promoteFraction = GetParam("promote_fraction", promoteFraction);
+            demoteFraction = GetParam("demote_fraction", demoteFraction);
             difficultyPin = GetParam("difficulty_pin", difficultyPin);
             spawnReserveSegments = Mathf.RoundToInt(
                 GetParam("spawn_reserve_segments", spawnReserveSegments));
@@ -268,8 +312,31 @@ namespace CrawlerParkour
         {
             if (difficultyPin >= 0f) return;
             float rate = agent.DistanceCovered / EpisodeSeconds;
-            if (rate >= promoteSpeed) m_Level = Mathf.Min(m_Level + 1, Levels - 1);
-            else if (rate < demoteSpeed) m_Level = Mathf.Max(m_Level - 1, 0);
+            GetGates(m_Level, out float promote, out float demote);
+            if (rate >= promote) m_Level = Mathf.Min(m_Level + 1, Levels - 1);
+            else if (rate < demote) m_Level = Mathf.Max(m_Level - 1, 0);
+        }
+
+        /// <summary>
+        /// Promote and demote rates for a given rung. Per-rung when promoteFraction is
+        /// positive, otherwise the flat pair runs 006 and 007 used.
+        /// </summary>
+        /// <remarks>
+        /// The flat path is kept so those two runs stay reproducible from their own
+        /// configs -- a config that silently means something different than it did when
+        /// it ran destroys the comparison the whole run existed to make.
+        /// </remarks>
+        public void GetGates(int level, out float promote, out float demote)
+        {
+            if (promoteFraction <= 0f)
+            {
+                promote = promoteSpeed;
+                demote = demoteSpeed;
+                return;
+            }
+            float reference = ReferenceRate[Mathf.Clamp(level, 0, Levels - 1)];
+            promote = promoteFraction * reference;
+            demote = demoteFraction * reference;
         }
 
         private void ResetEpisode()
@@ -388,6 +455,13 @@ namespace CrawlerParkour
             m_Stats.Add("CrawlerParkour/DistanceCovered", dist);
             // The curriculum's own progress curve, replacing Lesson Number.
             m_Stats.Add("CrawlerParkour/TerrainLevel", m_Level);
+            // The gate actually in force this episode. Recorded because runs 006 and
+            // 007 both had a promote gate below the policy's rate at every rung and
+            // neither run could show it without going back to the config; with this
+            // logged, "did the curriculum have anything to say" is one chart.
+            GetGates(m_Level, out float promote, out float demote);
+            m_Stats.Add("CrawlerParkour/PromoteGate", promote);
+            m_Stats.Add("CrawlerParkour/RateMinusGate", rate - promote);
             // ...and the same rate conditioned on the level it was earned at, which
             // is the only form of it that is not confounded by the level
             // distribution. See k_RateAtLevelKeys.

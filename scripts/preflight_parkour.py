@@ -59,6 +59,12 @@ PRESENT = [
     "TryPickSpawn", "SpawnYawDegrees", "spawn_reserve_segments", "spawn_yaw_jitter",
     "progress_per_meter", "velocity_per_second",
     "difficulty_pin", "initial_level", "promote_speed", "demote_speed",
+    # Run 008: the gate is a fraction of a per-rung reference curve. Absent here
+    # means the binary still has one flat gate for all ten rungs, and the run will
+    # ratchet to the ceiling again exactly as 006 and 007 did.
+    "promote_fraction", "demote_fraction", "PromoteGate", "RateMinusGate",
+    # The assertion that would have caught the run 006 reset bug at launch.
+    "RESET TORE THE RIG",
     "DistanceRate", "DistanceCovered", "TerrainLevel", "RespawnsPer100m",
     "RateAtLevel", "CrawlerParkour/", "Cleared", "Falls", "Overhang", "Squeeze",
     "segment_count", "max_boxes",

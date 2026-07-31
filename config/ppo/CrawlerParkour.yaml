@@ -79,7 +79,13 @@ behaviors:
     # that has not been measured, so this sits slightly UNDER run 005's total.
     # Undershooting is the cheap error (training ends early and the watchdog
     # terminates on its own); overshooting leaves LR high at the end.
-    max_steps: 68000000
+    #
+    # Run 008: MEASURED, not estimated. Run 007 sustained 862 steps/s over 21.5h on
+    # this exact env and instance type, so 24h of training is ~74.5M. 74M leaves the
+    # LR schedule finishing just inside the booked time. Do not re-derive this from
+    # the first few reporting windows -- env startup sits inside the first one and
+    # made the same estimate 2.3x too low for run 006.
+    max_steps: 74000000
     # Deliberately ABOVE the 300 decisions an episode now contains (1500 physics
     # steps / DecisionPeriod 5), so each episode yields exactly one trajectory,
     # ending at the truncation and bootstrapped there. Splitting an episode into
@@ -191,11 +197,42 @@ environment_parameters:
   # speed-vs-level is readable from the first summary window instead of only after
   # the ladder has been climbed.
   initial_level: 5
-  # Run 005's final policy managed ~0.55 m/s net at difficulty 0.5, so 0.5 promote
-  # / 0.15 demote puts its equilibrium around level 5-6 and lets it climb from
-  # there. The deadband is wide on purpose -- adjacent rungs differ by 1/9 of the
-  # difficulty scalar, and a narrow band would oscillate an arena every episode on
-  # nothing but per-episode variance.
+  #
+  # ---- RUN 008: the gate is a FRACTION per rung, not one speed for all of them ----
+  #
+  # Runs 006 and 007 both set promote_speed: 0.5 and both ratcheted every arena to
+  # the ceiling. That is not a bad number, it is the wrong SHAPE of number. 0.5 m/s
+  # is trivial on flat and hard at difficulty 1.0, so a single value is either below
+  # the policy at every rung (ratchets up) or above it at every rung (strands) --
+  # there is no value that holds a population in the middle. DESIGN 8.9.
+  #
+  # The gate is now promote_fraction x ReferenceRate[level], where ReferenceRate is
+  # what run 007's final policy actually did at each rung (CrawlerParkourEnvController).
+  # Run 007's measured rates, last 4M steps: L6 0.834, L7 0.667, L8 0.613, L9 0.537.
+  # It sat at mean level 8.65 with promote_speed 0.5 -- below all four.
+  #
+  # THESE TWO NUMBERS WERE CHOSEN BY scripts/check_curriculum_gates.py, NOT BY EYE.
+  # The obvious pair -- 1.0 promote (beat what the last policy did) and a wide 0.55
+  # demote -- FAILS: at level 8 it gives p(promote) 0.46 against p(demote) 0.03, an
+  # 18x upward bias, and the ladder ratchets to the ceiling again just more slowly.
+  # A gate at the median of a distribution promotes half the time and demotes almost
+  # never; that is a ratchet however the number was derived.
+  #
+  # 1.15 / 0.85 balances the walk against run 007's own per-episode spread:
+  #
+  #   rung   p(up)  p(down)  stay
+  #   L6      0.35    0.49   0.16
+  #   L7      0.33    0.42   0.25
+  #   L8      0.26    0.28   0.47
+  #   L9      0.16    0.16   0.68   (ceiling)
+  #
+  # so an arena holds its rung most episodes, and a POPULATION spreads across the
+  # ladder instead of collecting at one end. Climbing then requires the policy to
+  # actually get 15% better, which is the point.
+  promote_fraction: 1.15
+  demote_fraction: 0.85
+  # Kept so runs 006 and 007 stay reproducible from their own configs. Ignored
+  # whenever promote_fraction is positive.
   promote_speed: 0.5
   demote_speed: 0.15
   # Negative = adapt. An eval or viewer build has no python side channel, so it

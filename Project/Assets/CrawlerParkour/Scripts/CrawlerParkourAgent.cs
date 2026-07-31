@@ -652,6 +652,8 @@ namespace CrawlerParkour
         /// </remarks>
         private void MoveRig(Vector3 target, float yawDegrees, Vector3 velocity)
         {
+            SnapshotRig();
+
             if (yawDegrees != 0f)
             {
                 // About Body's own pivot, so this changes heading without moving it.
@@ -663,6 +665,78 @@ namespace CrawlerParkour
             {
                 bp.rb.linearVelocity = velocity;
                 bp.rb.angularVelocity = Vector3.zero;
+            }
+
+            AssertRigIntact();
+        }
+
+        // Body-local positions of every part, taken immediately before a MoveRig and
+        // compared immediately after. See AssertRigIntact.
+        private Vector3[] m_RigSnapshot;
+        private bool m_RigBreakReported;
+
+        private void SnapshotRig()
+        {
+            var parts = m_Jd.bodyPartsDict.Values;
+            if (m_RigSnapshot == null || m_RigSnapshot.Length != parts.Count)
+            {
+                m_RigSnapshot = new Vector3[parts.Count];
+            }
+            int i = 0;
+            foreach (var bp in parts)
+            {
+                m_RigSnapshot[i++] = body.InverseTransformPoint(bp.rb.position);
+            }
+        }
+
+        /// <summary>
+        /// A rigid move must not change any part's position RELATIVE TO THE BODY.
+        /// Checked, not assumed.
+        /// </summary>
+        /// <remarks>
+        /// This is the assertion whose absence cost run 006. Every pre-launch check
+        /// that run had was on GEOMETRY -- that generated tracks are traversable, that
+        /// spawn points have clear ground and headroom -- and none was on the AGENT
+        /// arriving there in one piece. The reset had been tearing the rig apart since
+        /// the environment was written; it stayed invisible because respawns move the
+        /// agent a few metres and a rig stretched by a few metres reads as ordinary
+        /// contact noise. Mid-track spawning multiplied the same defect by fifty and
+        /// burned a full 24 h run before anyone watched a video.
+        ///
+        /// Body-local rather than world offsets is what makes this correct for
+        /// TeleportTo as well: a respawn deliberately preserves whatever pose the fall
+        /// left, so the offsets differ from episode to episode and only their
+        /// invariance ACROSS THE MOVE is the actual contract. The tolerance is loose
+        /// enough that float error in a transform round-trip cannot trip it and tight
+        /// enough that the run 006 bug -- which displaced parts by metres -- could not
+        /// have hidden under it.
+        ///
+        /// Reported once per agent. A torn rig recurs every episode, and thousands of
+        /// identical errors would bury the first one.
+        /// </remarks>
+        private void AssertRigIntact()
+        {
+            const float tolerance = 0.02f;
+            if (m_RigBreakReported || m_RigSnapshot == null) { return; }
+
+            int i = 0;
+            float worst = 0f;
+            string worstName = null;
+            foreach (var bp in m_Jd.bodyPartsDict.Values)
+            {
+                float d = Vector3.Distance(body.InverseTransformPoint(bp.rb.position),
+                                           m_RigSnapshot[i++]);
+                if (d > worst) { worst = d; worstName = bp.rb.name; }
+            }
+            if (worst > tolerance)
+            {
+                m_RigBreakReported = true;
+                Debug.LogError(
+                    $"{name}: RESET TORE THE RIG. Part '{worstName}' moved {worst:F2} m "
+                    + "relative to the body during a rigid move, which must be zero. "
+                    + "The joints are now violated by that much and the solver will "
+                    + "answer with a corrective impulse. Do not trust any distance or "
+                    + "fall metric from this run.");
             }
         }
     }
