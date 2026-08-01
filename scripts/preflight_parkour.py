@@ -68,6 +68,22 @@ PRESENT = [
     "DistanceRate", "DistanceCovered", "TerrainLevel", "RespawnsPer100m",
     "RateAtLevel", "CrawlerParkour/", "Cleared", "Falls", "Overhang", "Squeeze",
     "segment_count", "max_boxes",
+    # ---- Run 009 ----
+    # Per-foot friction. The materials are built at run time and named by
+    # interpolation, so these are the constant parts. Absent means the shipped
+    # player still has a crawler carrying no physics material at all -- every
+    # contact at the flat 1.1 average, and four policy outputs wired to nothing.
+    "CrawlerFoot", "CrawlerBody", "foot collider(s) found",
+    # The air-phase price. Absent means the binary trains runs 006-008's reward
+    # while the config claims otherwise.
+    "airborne_per_second", "AirborneFraction", "AirborneReward",
+    "FootFriction", "FootRelease",
+    # Obstacle stats conditioned on terrain level: the run 008 report's first
+    # recommendation, and the thing that makes the marginal series safe to read.
+    "ClearedLevel",
+    # The correction knob for a reference curve that cannot be measured before
+    # launch, because there is no policy for this action space yet (11.4).
+    "reference_rate_scale",
 ]
 ABSENT = [
     "finish_bonus", "progress_weight", "velocity_weight",
@@ -134,7 +150,114 @@ print(f"\n   episode {ep['max_episode_steps']} steps = {seconds:.0f}s"
       f" = {decisions} decisions;"
       f" discount horizon {1/(1-gamma)*DECISION_PERIOD*PHYS_DT:.0f}s")
 
-print("\n3. built binary matches the environment")
+print("\n3. the rig in the prefab is the rig the code expects")
+# A SYMBOL CHECK CANNOT SEE ANY OF THIS. The action count, the observation width
+# and every joint limit live in serialised asset data, not in the assembly, so the
+# check below -- "these C# strings are in the DLL" -- would pass with a prefab that
+# still declares 20 actions and hinges that only travel one way. Run 009 changes
+# the rig more than it changes the code, which makes this the half that matters,
+# and BuildAll is the only thing that writes it. Forgetting to re-run the builder
+# after editing its constants is a completely silent way to train the old animal.
+PREFAB = os.path.join(ROOT, "Project", "Assets", "CrawlerParkour", "Prefabs",
+                      "CrawlerParkourEnv.prefab")
+AGENT = os.path.join(os.path.dirname(CTRL), "CrawlerParkourAgent.cs")
+BUILDER = os.path.join(ROOT, "Project", "Assets", "CrawlerParkour", "Editor",
+                       "CrawlerParkourBuilder.cs")
+
+prefab = io.open(PREFAB, encoding="utf-8").read()
+builder = io.open(BUILDER, encoding="utf-8").read()
+agent_cs = io.open(AGENT, encoding="utf-8").read()
+
+
+def cs_const(source, name):
+    m = re.search(rf"const\s+\w+\s+{name}\s*=\s*(-?[\d.]+)f?;", source)
+    return float(m.group(1)) if m else None
+
+
+def prefab_int(key):
+    m = re.search(rf"{key}:\s*(\d+)", prefab)
+    return int(m.group(1)) if m else None
+
+
+want_actions = int(sum(cs_const(agent_cs, n) or 0 for n in
+                       ("NumJointTargetActions", "NumStrengthActions", "NumFrictionActions")))
+check(prefab_int("m_NumContinuousActions") == want_actions,
+      f"prefab declares {prefab_int('m_NumContinuousActions')} continuous actions,"
+      f" agent constants sum to {want_actions}")
+
+# 6 orientation + 6 velocity + 1 height + 4 contacts + 3 track + N prev actions,
+# plus two rays per height-field cell. Recomputed here rather than read from the
+# prefab twice, because the failure being guarded against is the two disagreeing.
+grid_f = int(re.search(r"GridForward\s*=\s*(\d+)", agent_cs).group(1))
+grid_l = int(re.search(r"GridLateral\s*=\s*(\d+)", agent_cs).group(1))
+want_obs = 6 + 6 + 1 + 4 + 3 + want_actions + 2 * grid_f * grid_l
+check(prefab_int("VectorObservationSize") == want_obs,
+      f"prefab declares {prefab_int('VectorObservationSize')} observations,"
+      f" CollectObservations writes {want_obs} (grid {grid_f}x{grid_l})")
+
+# Joint limits, per body part, against the builder's own constants. Parsed by
+# walking the prefab's YAML documents so a limit can be attributed to the leg it
+# belongs to -- there are eight ConfigurableJoints and the hips and knees want
+# different answers.
+docs = re.split(r"\n(?=--- !u!)", prefab)
+names = {}
+for d in docs:
+    fid = re.search(r"--- !u!\d+ &(\d+)", d)
+    nm = re.search(r"\n  m_Name: (\S+)", d)
+    if fid and nm:
+        names[fid.group(1)] = nm.group(2) if nm.lastindex == 2 else nm.group(1)
+
+
+def limit(doc, key):
+    m = re.search(rf"{key}:\n(?:    \w+: [^\n]*\n)*?    limit: (-?[\d.e+]+)", doc)
+    return float(m.group(1)) if m else None
+
+
+want = {
+    "leg": (cs_const(builder, "HipLowXLimit"), cs_const(builder, "HipHighXLimit"),
+            cs_const(builder, "HipYLimit")),
+    "foreleg": (cs_const(builder, "KneeLowXLimit"), cs_const(builder, "KneeHighXLimit"), None),
+}
+seen = {"leg": 0, "foreleg": 0}
+bad = []
+for d in docs:
+    if "\nConfigurableJoint:" not in d:
+        continue
+    go = re.search(r"m_GameObject: \{fileID: (\d+)\}", d)
+    who = names.get(go.group(1), "?") if go else "?"
+    kind = "foreleg" if who.startswith("foreleg") else "leg" if who.startswith("leg") else None
+    if kind is None:
+        continue
+    seen[kind] += 1
+    lo, hi, y = want[kind]
+    got = (limit(d, "m_LowAngularXLimit"), limit(d, "m_HighAngularXLimit"),
+           limit(d, "m_AngularYLimit"))
+    for value, target, axis in zip(got, (lo, hi, y), ("lowX", "highX", "Y")):
+        if target is not None and abs((value if value is not None else 1e9) - target) > 1e-3:
+            bad.append(f"{who}.{axis} is {value}, builder says {target}")
+
+check(seen == {"leg": 4, "foreleg": 4},
+      f"found {seen['leg']} hip and {seen['foreleg']} knee joints (expected 4 and 4)")
+check(not bad, "every leg joint carries the builder's limits" + (f" ({bad})" if bad else ""))
+
+# Symmetric about the authored pose is the whole point of widening them -- an
+# upside-down crawler has the workspace an upright one has only if the range is.
+hip_lo, hip_hi = cs_const(builder, "HipLowXLimit"), cs_const(builder, "HipHighXLimit")
+knee_lo, knee_hi = cs_const(builder, "KneeLowXLimit"), cs_const(builder, "KneeHighXLimit")
+check(abs(hip_lo + hip_hi) < 1e-6 and abs(knee_lo + knee_hi) < 1e-6,
+      f"ranges are symmetric about zero: hip [{hip_lo}, {hip_hi}], knee [{knee_lo}, {knee_hi}]")
+
+for field, want_value in (("maxJointSpring", 80000), ("jointDampen", 10000),
+                          ("maxJointForceLimit", 40000)):
+    got = prefab_int(field)
+    check(got == want_value,
+          f"{field} is {got} (run 008 set this by hand and a rebuild used to revert it)")
+
+check(os.path.getmtime(PREFAB) > os.path.getmtime(BUILDER),
+      "prefab is newer than CrawlerParkourBuilder.cs (BuildAll has been re-run since"
+      " its constants last moved)")
+
+print("\n4. built binary matches the environment")
 if not os.path.exists(DLL):
     check(False, f"no built assembly at {DLL} -- run BuildMultiLinux")
 else:

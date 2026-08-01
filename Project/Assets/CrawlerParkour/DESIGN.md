@@ -1188,3 +1188,280 @@ means **the first summary windows after any restart describe easier terrain**. R
 (run 008's went 1.84 → 3.35) and the jump means nothing. Any before/after comparison across
 a restart has to discard the re-climb, which is why §10.4's extension figures skip the
 first 2M steps after the boundary.
+
+## 11. Run 009 — an animal that can let go, and a reward that pays for air
+
+Run 008 answered its question and closed three others. What it left is a policy that
+walks well and cannot do parkour, and a fairly precise account of why: it has no way to
+release a foot, no way to fold a leg, and no reason to leave the ground. Run 009 changes
+all three, plus the two reporting defects run 008 exposed.
+
+| | run 008 | run 009 |
+|---|---|---|
+| continuous actions | 20 | **24** (4 per-foot friction) |
+| vector observations | 168 | **170** |
+| foot friction (contact) | 1.1, fixed | **0 – 2.2, commanded, per foot** |
+| body / upper-leg friction | 1.1 | **0.24** |
+| hip range | X [−60, 0], Y ±20 | **X [−90, 90], Y ±45** |
+| knee range | X [0, 150] | **X [−150, 150]** |
+| air-phase reward | none | **0.05 / s** |
+| `beta` schedule | linear → 1e-5 | **constant 0.005** |
+| obstacle stats | aggregated | **conditioned on rung** |
+| `max_steps` | 97M (sized on 862 steps/s) | **55M** (sized on 646) |
+
+### 11.1 Grip is a decision, not a property of the terrain
+
+The rollouts kept showing the same thing: a foot dropped into a gap or wedged behind a
+lip, and a crawler unable to retract it because the only way out was to drag it sideways
+against 1.1 of grip. There was no actuator for this. Joint torque can pull harder, which
+run 008 doubled and which did not help, because the problem is not strength — it is that
+the animal has no way to stop holding on.
+
+Each foot now carries its own `PhysicsMaterial`, created **per agent at run time**, and
+commands its own friction ten times a second. Three details are load-bearing:
+
+**Per agent.** Thirty-two arenas share one prefab. A material assigned in the builder is
+one asset behind thirty-two crawlers, and writing to it from `OnActionReceived` would
+make every arena's feet carry the last friction any arena happened to command. That
+trains perfectly happily and means nothing.
+
+**Multiply combine.** Unity resolves a contact using the higher of the two materials'
+combine modes, and `ParkourGround` is Average while these are Multiply — so the foot wins
+every contact against the track and the coefficient is `GroundFriction × command`,
+identically on the floor, on a hurdle and on a beam. Under Average the same command would
+mean a different grip on every surface; under Minimum the top of the range would clamp to
+the track's own 1.6 and the animal could never grip harder than what it stands on.
+
+**The range is chosen so that a zero action is run 008.** The brief was "0 to twice the
+current friction". Run 008's contact was `(1.6 + 0.6) / 2 = 1.1` — the track's material
+paired with Unity's implicit default under Average — so the target span is `[0, 2.2]`,
+and as a multiplier on 1.6 that is `[0, 1.375]`. Whose midpoint is 0.6875, and
+`1.6 × 0.6875 = 1.1` exactly. A neutral command is not approximately the old physics, it
+*is* the old physics, which is what makes it meaningful to initialise the four new policy
+outputs at zero and call the warm start behaviourally identical.
+
+### 11.2 The grippiest surface on the animal was the one with no actuator
+
+`VerifyFrictionControl` steps real PhysX and measures a body sliding on a plane against
+`v0²/(2·μ·g)`. Two of its results were not what the arithmetic on paper said, and the
+second is the interesting one.
+
+| shape | measured / Coulomb |
+|---|---|
+| box, face down | 2.00× |
+| sphere, point contact | 1.00× |
+| capsule, on its end | 1.00× |
+| capsule, on its side | 2.00× |
+
+`PxFrictionType` patch puts **two friction anchors** under a face or line contact and
+allows each the full `μN`; a point contact gets one. So the coefficient stated in the
+code is exactly right for a foot placed on its tip and **double** for any limb lying
+along the ground.
+
+Which means that in run 008, a leg fallen flat across an edge was getting **2.2** of
+effective grip — the stickiest contact anywhere on the crawler, on the part with no way
+to let go, in precisely the pose the animal is in when it is stuck. That is the snag
+mechanism, measured rather than inferred, and it is why the brief's "reduce the friction
+of all other body parts" is not a tidying-up detail. At `BodyFriction` 0.15 the same
+scraping limb now sees 0.48 effective, a 4.6× reduction.
+
+`BodyFriction` is deliberately not zero: a frictionless torso cannot brace against
+anything, and bellying over a hurdle needs the body to purchase something.
+
+**The general form: a friction coefficient is a property of a contact, not of a
+material.** Run 008 learned that the combine mode makes 1.6 mean 1.1. Run 009 learns that
+the collider's shape makes 1.1 mean 2.2. Neither is visible anywhere except by stepping
+the engine and measuring.
+
+### 11.3 A leg that only bends one way cannot work upside down
+
+The example crawler's limits are authored for walking on a floor the right way up. The
+hip travels [−60, 0] about X and the knee [0, 150] — both ranges sit **entirely on one
+side of the joint's zero**, and a `ConfigurableJoint`'s zero is the pose the rig was
+authored in. So an inverted crawler has a different workspace from an upright one, by
+construction, and no amount of training can give it one. Nothing can fold under the body
+either.
+
+Making each range symmetric about zero buys both at once. Hip X [−90, 90], hip Y ±45,
+knee X [−150, 150].
+
+**The cost is resolution, and it is real.** `SetJointTargetRotation` lerps the action
+across the limit range, so tripling the hip's X range divides the angular precision of a
+unit of policy output by three — and foot placement on a `Beam` is exactly the skill that
+needs precision. Y is widened less than X for that reason: the splay only has to reach
+under the body, not around it. If run 009 loses ground on `Beam` while gaining on the
+traps, that trade is where to look first.
+
+### 11.4 The calibration rule cannot be followed this time, and saying so
+
+§10.1 established that `ReferenceRate` measures the terrain **and the physics together**,
+and must be re-measured whenever either moves. Run 009 moves both. By that rule its curve
+is wrong.
+
+**It cannot be re-measured.** The procedure is to run the previous run's final policy at
+each pinned rung. Run 009 changes the action space, so run 008's policy emits twenty
+numbers into a rig that wants twenty-four and drives joints whose limits have moved.
+There is no policy that can be measured against this rig until one has been trained on
+it. The rule assumes a continuity that a rig change breaks.
+
+So the curve ships as run 008's, known to be wrong by an unknown factor, and
+`reference_rate_scale` is the correction — an environment parameter, so it takes a
+`--resume` rather than a new Linux player. The procedure is: read `RateAtLevel/<L>` a few
+million steps in, compare against `ReferenceRate × scale`, and if the gates sit on one
+side of the distribution at every rung, set it and restart.
+
+It launches at 1.0, which is the **conservative** direction rather than a neutral one.
+Too high a reference makes promotion hard and strands arenas low, wasting terrain
+exposure; too low re-creates the ratchet that made runs 006 and 007 unreadable. Stranding
+is recoverable from inside the run. A ratchet is not.
+
+### 11.5 The air phase has a price
+
+Run 008 eliminated three explanations for `Gap` sitting at 0.7–3.1% cleared after 92M
+steps (§10.5). What was left is structural, and it is not timidity.
+
+Every positive term in this environment is a rate — per metre of new ground, per second
+of good locomotion — and a leap is neither. It is a second in which no foot can push, no
+metre is guaranteed, and a failure costs a respawn **plus** the walk back over ground the
+max-so-far ratchet has already paid for and will not pay for twice. Stopping at the edge
+was the policy being right about the reward it was given.
+
+`airborne_per_second` pays 0.05 per second with every foot clear of the ground, which is
+3× `velocity_per_second`. Sized to tilt the decision at the edge rather than to make
+airtime an end in itself: a 0.4 s leap earns 0.02 against the 0.156 that clearing a 2 m
+gap earns in progress.
+
+The exploits are closed **by shape rather than by clamps**. The term carries the same
+speed and heading factors as the velocity reward, so hopping on the spot pays zero — the
+speed factor is zero at zero down-track velocity — and so does being launched backwards
+off a hurdle. And it is suppressed once the body is below the local ground line, so the
+agent cannot farm airtime by throwing itself off the track; that is a fall, and falling
+is already priced.
+
+Set it to 0 to reproduce runs 006–008 exactly.
+
+### 11.6 A run that must discover something cannot anneal its exploration away
+
+Run 008 finished with entropy at −0.04 and still falling: effectively deterministic. That
+is the correct end state for a run whose job is to exploit a gait it already has, and it
+is fatal for this one. Every change above is an invitation to a behaviour the current
+policy has never once emitted — releasing a foot, folding a leg, leaving the ground
+deliberately. None is reachable by sharpening a distribution around what run 008 already
+does.
+
+`beta_schedule: linear` decays to a **hardcoded** minimum of 1e-5
+(`ppo/optimizer_torch.py`), so "give beta a floor" cannot be done by choosing a better
+start value — the schedule always lands in the same place. Holding it constant *is* the
+floor.
+
+The cost is accepted rather than hidden: a policy kept stochastic to the last step lands
+less precisely than one allowed to converge. Run 009 should be expected to end with a
+scruffier gait than run 008's at equal skill. If it finds the behaviours, run 010's job
+is to decay beta again and sharpen them.
+
+### 11.7 Conditioning the obstacle stats, and one cheap curve that makes the raw ones safe
+
+§10.3's finding was that `Cleared/<pattern>` is aggregated over arenas whose rungs are
+moving, so a quarter-on-quarter delta measures the curriculum and the policy at once. Run
+008's raw series said nine of ten obstacles got worse; binned by rung, nine of ten got
+better; both from the same events file.
+
+Both measures are now also emitted per rung — `Cleared/<Pattern>/L<n>` and
+`Falls/<Pattern>/L<n>` — weighted identically to the marginal ones, so the conditioned
+series aggregate back to them exactly. The marginal keys stay: runs 006–008 have no
+conditioned form, and dropping them would make run 009 incomparable to everything before
+it. The point was never that the aggregate is meaningless, only that it must not be read
+without its condition.
+
+That is 200 tags, which is the right thing to *analyse* and not something anyone reads
+live. So there is also `ClearedLevel/<Pattern>` — ten tags, the mean rung each pattern's
+samples came from, weighted the same way. `Cleared/Beam` falling while
+`ClearedLevel/Beam` rises is the whole of run 008's headline error, visible in two lines,
+at the time it matters.
+
+The tag count forces `summary_freq` 10000 → 30000. tfevents repeats every tag name on
+every write — run 008 measured **148 bytes per scalar point** across 73 tags — so 220
+tags at the old frequency would have written ~220 MB of events to sync and load. It also
+makes the new buckets readable: a window is now ~100 episodes rather than ~33, which the
+thinnest (pattern, rung) cells need.
+
+### 11.8 A rig change cannot warm-start, unless the change is invertible
+
+Three things move at once — 168 → 170 observations, 20 → 24 actions, and joint limits
+that change what every existing action *means*. Any one makes `--initialize-from` refuse
+the checkpoint, and the third would be worse if it did not: the weights would load and
+the policy would drive its legs to angles it never chose.
+
+Starting from noise throws away 36 hours and $46, and worse, spends most of a 24 h
+booking re-learning to walk instead of testing the four things run 009 is about. So
+`scripts/expand_checkpoint.py` transforms the tensors instead, chosen so the policy is
+**behaviourally identical at launch** — not approximately, not after settling:
+
+- the four new observation columns and four new action rows get **zero weight**, so they
+  contribute exactly nothing, and a zero friction action is exactly run 008's 1.1 contact
+  (§11.1);
+- the joint limits are absorbed into an **affine remap of the action head**: if
+  `a' = s·a + o` satisfies `lerp(new, a') == lerp(old, a)`, then rescaling the head makes
+  the new network emit the old network's joint *angles* for every input. `log_sigma`
+  shifts by `log s`, which preserves exploration in **angle** space — the policy does not
+  start flailing because its dial got longer.
+
+Two things nearly went wrong, and both were caught by writing the verifier before
+believing the script.
+
+**The retired observations are constant, but not constant zero.** Run 006 retired two
+track-relative slots and has written a literal `0.0` into both ever since, so deleting
+them looks free. It is not: the running mean for those slots was inherited from run 005
+through four warm starts, and a mean decays by only `(x − mean)/total_steps` per sample,
+so after 184M samples it is still 0.0302 and a zero input normalises to **−0.3253**. Each
+column contributes a fixed *vector* to every layer it feeds. That contribution is folded
+into the receiving biases, which makes the deletion exact rather than approximately
+harmless.
+
+**The head does not emit the action.** Both the training path
+(`AgentAction.to_action_tuple(clip=True)`) and the ONNX export path send the environment
+`clamp(x, −3, 3) / 3`. So the bias offset carries a **factor of three** — `x' = s·x + 3o`
+is what produces `a' = s·a + o` downstream of that divide. Writing `o` would have landed
+every joint a third of the way to the wrong angle, while looking entirely reasonable in
+the tensor.
+
+Equivalence is exact wherever the old head did not saturate. Where it *did* — `|x| > 3`,
+meaning "further than this joint can travel" — the new angle continues past the old limit
+in the same direction the old policy was already pushing. Run 008 pinned against a
+mechanical stop now gets the travel it was asking for, which is the widened joint doing
+its job rather than a defect in the remap.
+
+Adam's moments are dropped rather than remapped: they estimate a gradient field that has
+just changed shape, and rebuilding them costs a few thousand steps against getting a
+subtle rescaling wrong for a whole run.
+
+**The launch check, which costs two minutes and is the one that matters:** run 009's
+first summary window should report `DistanceRate` near run 008's final, not near zero. A
+scrambled policy is visible immediately rather than at the end of the booking.
+
+### 11.9 Two silent reverts, one closed and one still open
+
+`BuildAll` re-instantiates the example Crawler on every run, and the example ships
+`maxJointSpring` 40000. Run 008's doubling was a **hand edit on the prefab**, so running
+the builder would have quietly halved the joint drive of the run under test and rewritten
+the prefab with it — the only evidence being a policy that suddenly could not climb. The
+gains are constants in the builder now, applied explicitly.
+
+The general form is the one §9.6 and §10.2 keep arriving at from different directions:
+*anything a build step regenerates must have every value it regenerates under its own
+control, or the build is a silent revert waiting for someone to run it.*
+
+Preflight could not have caught it. Its binary check looks for C# strings in the assembly,
+and the action count, the observation width and every joint limit live in **serialised
+asset data** — a prefab still declaring 20 actions and one-way hinges passes a symbol
+check completely. Run 009 changes the rig more than it changes the code, which makes that
+the half that matters, so preflight now reads the prefab directly and checks it against
+the builder's and the agent's own constants, including that the ranges really are
+symmetric about zero.
+
+Still open, and shared infrastructure rather than this project's to change: the scheduled
+staging sync runs the **crawler-sumo** worktree's copy of `sync_cloud_staging.ps1`, which
+compares size only and therefore skips `checkpoint.pt` forever (§10.2). The fixed version
+has been on this branch since run 008. Run 009 does not depend on it — the warm start is
+built from an expanded copy of a checkpoint already verified by md5 — but the next run
+that wants a fresh seed will hit it again.

@@ -45,38 +45,40 @@ behaviors:
     hyperparameters:
       batch_size: 4096
       buffer_size: 40960
-      # RUN 008 EXTENSION (+12h, restart at step ~58.6M with --resume).
-      # These are NOT new hyperparameters. They are 0.0003 and 0.005 rescaled so
-      # the linear schedules are CONTINUOUS across the restart while still
-      # annealing to their floors at the new max_steps.
-      #
-      # Every schedule is anchored at step 0:
-      #     value = (v0 - vmin) * (1 - step/max_steps) + vmin
-      # (ModelUtils.polynomial_decay). So raising max_steps ALONE silently jumps
-      # every schedule back UP: LR would go 6.26e-5 -> 1.19e-4, a 1.9x increase
-      # dropped on a policy that has been converging for 58M steps and whose Adam
-      # state is restored along with it. Extending a run is not a reason to shock
-      # it. Solving instead for the v0 that reproduces the CURRENT decayed value
-      # under the new denominator,
-      #     v0' = (v_now - vmin) / (1 - s/M_new) + vmin
-      # makes the restart invisible to the optimiser and still lands the anneal on
-      # the new finish.
-      #
-      # v_now was READ from this run's own TensorBoard -- Policy/Learning Rate
-      # 6.2634e-5 and Policy/Beta 1.0518e-3 at step 58,560,000 -- not predicted,
-      # and the formula above was checked against those logged values before being
-      # used to invert it (agreed to 0.06%, which is summary-step granularity).
-      #
-      # The two floors are NOT both zero, and using one for both would be wrong at
-      # the tail: LR floors at 1e-10, beta at 1e-5 (ppo/optimizer_torch.py).
-      # epsilon is untouched because its schedule is constant, below.
-      learning_rate: 0.000158
-      beta: 0.00264
+      # RUN 009 IS A NEW RUN, NOT A RESUME, so the schedules are anchored at step 0
+      # again and these go back to the project's standard starting values. Run 008's
+      # extension carried rescaled ones (0.000158 / 0.00264) so its linear schedules
+      # stayed continuous across a --resume that moved max_steps; that arithmetic is
+      # DESIGN 10.8 and applies to restarts only. Carrying those numbers into a fresh
+      # run would start it at half the intended learning rate for no reason at all.
+      learning_rate: 0.0003
+      beta: 0.005
       epsilon: 0.2
       lambd: 0.95
       num_epoch: 3
       learning_rate_schedule: linear
-      beta_schedule: linear
+      #
+      # ---- RUN 009: BETA GETS A FLOOR, AND THE FLOOR IS THE WHOLE VALUE ----
+      #
+      # Run 008 finished with entropy at -0.04 and still falling -- a policy that is
+      # effectively deterministic. That is the right end state for a run whose job is
+      # to exploit a gait it already has, and it is fatal for this one. Every change
+      # run 009 makes is an invitation to a behaviour the current policy has never
+      # once emitted: releasing a foot to slide out of a trap, folding a leg under the
+      # body, leaving the ground on purpose. None of those is reachable by sharpening
+      # a distribution around what run 008 already does.
+      #
+      # `linear` decays beta to a HARDCODED minimum of 1e-5 (ppo/optimizer_torch.py),
+      # which is zero for any practical purpose -- so "give beta a floor" cannot be
+      # done by picking a better start value under a linear schedule, because the
+      # schedule always lands on the same place. Holding it constant IS the floor.
+      #
+      # THE COST IS REAL AND IS ACCEPTED. A policy kept stochastic to the last step
+      # lands less precisely than one allowed to converge, and precise landing is
+      # exactly what a Beam needs; run 009 should be expected to end with a slightly
+      # scruffier gait than run 008's at the same skill. If it finds the behaviours,
+      # run 010's job is to decay beta again and sharpen them.
+      beta_schedule: constant
       # Pinned constant deliberately: settings.py inherits both schedules from
       # learning_rate_schedule unless told otherwise, and decaying the clip
       # range on top of LR and beta makes late updates conservative three ways
@@ -119,14 +121,48 @@ behaviors:
     # in 77,111 s -- stiffer joints cost solver time and higher rungs cost boxes),
     # so 97M is ~14.1h more from the restart. Sized to UNDERSHOOT the watchdog for
     # the reason given above: ending early is free, ending with LR still high is not.
-    max_steps: 97000000
+    #
+    # ---- RUN 009: SIZED FROM THE END OF RUN 008, NOT ITS START ----
+    #
+    # THROUGHPUT IS A FUNCTION OF TERRAIN LEVEL, so a curriculum that works makes its
+    # own step budget wrong. Every estimate before this one was taken from the fast
+    # part of the previous run and every one overshot:
+    #
+    #   run 007 measured        862 steps/s   -> run 008 booked 74M
+    #   run 008 first half      758.6         (mean level ~6.3)
+    #   run 008 second half     646           (mean level 7.42)
+    #   run 008 delivered       92.4M of 97M in 36.0 h
+    #
+    # The second-half figure is the honest one: higher rungs carry more obstacle
+    # boxes, and a run that succeeds spends its time there. 646 x 86,400 s = 55.8M for
+    # the 24 h ceiling, and 55M is booked against it -- a 1.4% margin, plus whatever
+    # run 009's own additions cost (four more actions, a per-decision friction write,
+    # 210 more stat tags, all small but none of them free).
+    #
+    # If anything this is still generous, because run 009 starts on a policy that
+    # cannot yet climb and will sit at cheap low rungs while it learns. Undershooting
+    # remains the cheap error: training that ends early costs nothing but the
+    # watchdog's remaining minutes, while training that ends with the learning rate
+    # still high wastes the whole anneal.
+    max_steps: 55000000
     # Deliberately ABOVE the 300 decisions an episode now contains (1500 physics
     # steps / DecisionPeriod 5), so each episode yields exactly one trajectory,
     # ending at the truncation and bootstrapped there. Splitting an episode into
     # several horizon-length trajectories would be correct too, but one episode =
     # one GAE segment keeps the truncation fix easy to reason about.
     time_horizon: 1000
-    summary_freq: 10000
+    # 10000 -> 30000 for run 009, and it is the per-rung obstacle stats that force it.
+    # Conditioning Cleared and Falls on terrain level turns 20 tags into 220, and
+    # tfevents repeats every tag name on every write: run 008 measured 148 bytes per
+    # scalar point across 73 tags, so the same run at 10000 would now write ~220 MB of
+    # events to sync and load. 30000 puts it back near run 008's 92 MB.
+    #
+    # It also makes the new buckets readable rather than merely present. A window is
+    # ~30000/300 = 100 episodes, and those spread over ten rungs and ten patterns; at
+    # 10000 the thinnest (pattern, rung) cells would carry single-figure samples and
+    # the conditioned series -- the whole point of the change -- would be noise.
+    # 1833 windows over 55M steps is one every ~47 s, which is still live monitoring.
+    summary_freq: 30000
     # No self_play block. Parkour is single-agent against a fixed task, so
     # there is no ghost-trainer non-stationarity -- which also means progress is
     # readable directly from reward instead of needing ELO.
@@ -182,6 +218,35 @@ environment_parameters:
   # in that literature because it needs a controller that FOLLOWS a commanded
   # velocity. We want "as far as possible" instead.
   target_speed: 2.5
+
+  # ---- RUN 009: the air phase has a price ----
+  #
+  # Run 008 eliminated three explanations for `Gap` sitting at 0.7-3.1% cleared after
+  # 92M steps. Not training duration: +0.1 to +0.8 points across 33M extra steps. Not
+  # actuation: doubling the joint drive moved it by nothing. Not recklessness: falls
+  # per entry 0.02, so the crawler is not failing the jump, it is walking to the edge
+  # and stopping. What was left is that the reward makes stopping correct.
+  #
+  # Every positive term here is a rate against ground covered or seconds of good
+  # locomotion, and a leap is neither. It is a second in which no foot can push, no
+  # metre is guaranteed, and failure costs a respawn PLUS the walk back over ground
+  # the max-so-far ratchet has already paid for and will not pay for twice. Stopping
+  # at the edge was never timidity; it was the policy being right about its reward.
+  #
+  # 0.05/s is 3x velocity_per_second, so a second of flight is worth about three
+  # seconds of good running. Sized to be felt without dominating: a 0.4 s leap earns
+  # 0.02 against the 0.156 that clearing a 2 m gap earns in progress, so it tilts the
+  # decision at the edge rather than making airtime an end in itself.
+  #
+  # The exploits are closed by shape rather than by clamps -- the term carries the
+  # SAME speed and heading factors as the velocity reward, so hopping on the spot pays
+  # zero (speed factor is zero at zero down-track velocity), being launched backwards
+  # pays zero, and the agent cannot farm airtime by throwing itself off the track
+  # because the term is suppressed once the body is below the local ground line.
+  # Falling is already priced, by respawn_penalty.
+  #
+  # Set to 0 to reproduce runs 006-008 exactly.
+  airborne_per_second: 0.05
 
   # A respawn already costs the time to re-cover the ground (progress pays only on
   # max-so-far), so this stays a nudge rather than the real price of failure.
@@ -265,6 +330,30 @@ environment_parameters:
   # actually get 15% better, which is the point.
   promote_fraction: 1.15
   demote_fraction: 0.85
+  #
+  # ---- RUN 009: THE CALIBRATION RULE CANNOT BE FOLLOWED, AND SAYING SO ----
+  #
+  # DESIGN 10.1: ReferenceRate measures the terrain and the physics TOGETHER, and must
+  # be re-measured whenever either moves. Run 009 moves both -- new joint ranges, a new
+  # actuator, new body friction -- so by that rule its curve is wrong.
+  #
+  # It cannot be re-measured. The procedure is to run the previous run's final policy
+  # at each pinned rung, and run 009 changes the ACTION SPACE: run 008's policy emits
+  # 20 numbers into a rig that wants 24 and drives joints whose limits have moved. There
+  # is no policy that can be measured against this rig until one has been trained on it.
+  #
+  # So the curve below is run 008's, KNOWN to be wrong by an unknown factor, and this
+  # scalar is the correction. It is an environment parameter and not a rebuild, so the
+  # procedure is: read RateAtLevel/<L> a few million steps in, compare against
+  # ReferenceRate x this, and if the gates sit on one side of the distribution at every
+  # rung, set it and --resume. That is the same failure runs 006 and 007 died of, and
+  # this is the first run that can fix it without a new Linux player.
+  #
+  # 1.0 at launch is the CONSERVATIVE direction, not a neutral one: too high a reference
+  # makes promotion hard and strands arenas low, which wastes terrain exposure, while
+  # too low re-creates the ratchet that made two runs unreadable. Stranding is
+  # recoverable from within the run; a ratchet is not.
+  reference_rate_scale: 1.0
   # Kept so runs 006 and 007 stay reproducible from their own configs. Ignored
   # whenever promote_fraction is positive.
   promote_speed: 0.5

@@ -70,6 +70,9 @@ namespace CrawlerParkour
             + "by eye -- a gate at the median promotes half the time and demotes "
             + "almost never, which is a ratchet however it was derived.")]
         public float demoteFraction = 0.85f;
+        [Tooltip("Uniform multiplier on ReferenceRate. The escape hatch for a rig "
+            + "change whose curve cannot be measured before launch -- see 11.4.")]
+        public float referenceRateScale = 1f;
         [Tooltip("Negative: adapt. Zero or above: pin difficulty here and freeze the "
             + "curriculum. Eval builds use this.")]
         public float difficultyPin = -1f;
@@ -86,6 +89,10 @@ namespace CrawlerParkour
         public float velocityPerSecond = 0.0167f;
         [Tooltip("Down-track speed the dense reward peaks at, m/s.")]
         public float targetSpeed = 2.5f;
+        [Tooltip("Reward per second with all four feet off the ground, shaped by the "
+            + "same speed and heading factors as velocityPerSecond. Run 009's price "
+            + "for the air phase; zero reproduces runs 006-008.")]
+        public float airbornePerSecond = 0f;
         [Tooltip("Fraction of the control costs charged at difficulty 0.")]
         [Range(0f, 1f)] public float controlCostFloor = 0.1f;
 
@@ -149,6 +156,72 @@ namespace CrawlerParkour
         // Precomputed so RecordStats does no per-episode string work.
         private static readonly string[] k_ClearedKeys = BuildPatternKeys("Cleared");
         private static readonly string[] k_FallKeys = BuildPatternKeys("Falls");
+
+        /// <summary>
+        /// The same two measures, conditioned on the rung they were earned at.
+        /// Indexed [pattern][level].
+        /// </summary>
+        /// <remarks>
+        /// RUN 009, AND THE REASON IS RUN 008'S HEADLINE BEING WRONG. Read straight
+        /// off TensorBoard, run 008 said `Beam` fell from 58.1% cleared to 36.9%
+        /// across the run and that nine of ten obstacles got worse. Binned by the
+        /// terrain level each sample was actually taken at, nine of ten got BETTER.
+        /// Both numbers came from the same events file.
+        ///
+        /// The keys above are aggregated over every arena at whatever rung it has
+        /// reached, and a per-arena curriculum guarantees those rungs are moving. So
+        /// while `TerrainLevel` climbs, the same percentage describes harder terrain,
+        /// and a quarter-on-quarter delta measures the curriculum and the policy at
+        /// once with no way to separate them afterwards. It took an offline re-bin of
+        /// two events files to recover the real answer, and anyone watching the
+        /// marginal series live during the run would have concluded the opposite of
+        /// the truth.
+        ///
+        /// The fix is the one `RateAtLevel` already applies to distance rate:
+        /// condition on the level. 10 patterns x 10 rungs x 2 measures is 200 tags,
+        /// which is a lot to look at and exactly right to analyse -- and sparse, since
+        /// only rungs an arena actually visited are ever written.
+        ///
+        /// The marginal keys are KEPT rather than replaced. Runs 006-008 have no
+        /// conditioned form, so dropping the marginal one would make run 009
+        /// incomparable to every run before it; the point is not that the aggregate is
+        /// meaningless, it is that it must not be read without its condition.
+        /// </remarks>
+        private static readonly string[][] k_ClearedAtLevelKeys = BuildPatternLevelKeys("Cleared");
+        private static readonly string[][] k_FallAtLevelKeys = BuildPatternLevelKeys("Falls");
+
+        /// <summary>
+        /// The mean rung each pattern's samples were drawn from -- the confound
+        /// itself, plotted.
+        /// </summary>
+        /// <remarks>
+        /// Ten tags, and they are the ones that make the change above actually
+        /// useful DURING a run. Two hundred conditioned series are the right thing
+        /// to analyse afterwards and are not something anyone reads live; this pairs
+        /// one curve with each marginal series so the two can be laid on top of each
+        /// other. `Cleared/Beam` falling while `ClearedLevel/Beam` rises is the whole
+        /// of run 008's headline error, visible in two lines, at the time it matters.
+        ///
+        /// Weighted by `entered` exactly as the shares are, so it is the mean rung of
+        /// the SAMPLES rather than of the episodes -- otherwise it would not be the
+        /// denominator the marginal series is actually confounded by.
+        /// </remarks>
+        private static readonly string[] k_ClearedLevelKeys = BuildPatternKeys("ClearedLevel");
+
+        private static string[][] BuildPatternLevelKeys(string group)
+        {
+            var names = System.Enum.GetNames(typeof(SegmentPattern));
+            var keys = new string[names.Length][];
+            for (int p = 0; p < names.Length; p++)
+            {
+                keys[p] = new string[Levels];
+                for (int l = 0; l < Levels; l++)
+                {
+                    keys[p][l] = $"CrawlerParkour/{group}/{names[p]}/L{l}";
+                }
+            }
+            return keys;
+        }
 
         /// <summary>
         /// Distance rate broken out per terrain level.
@@ -268,6 +341,7 @@ namespace CrawlerParkour
             fallDepth = GetParam("fall_depth", fallDepth);
             velocityPerSecond = GetParam("velocity_per_second", velocityPerSecond);
             targetSpeed = GetParam("target_speed", targetSpeed);
+            airbornePerSecond = GetParam("airborne_per_second", airbornePerSecond);
             controlCostFloor = Mathf.Clamp01(GetParam("control_cost_floor", controlCostFloor));
 
             initialLevel = Mathf.RoundToInt(GetParam("initial_level", initialLevel));
@@ -275,6 +349,7 @@ namespace CrawlerParkour
             demoteSpeed = GetParam("demote_speed", demoteSpeed);
             promoteFraction = GetParam("promote_fraction", promoteFraction);
             demoteFraction = GetParam("demote_fraction", demoteFraction);
+            referenceRateScale = GetParam("reference_rate_scale", referenceRateScale);
             difficultyPin = GetParam("difficulty_pin", difficultyPin);
             spawnReserveSegments = Mathf.RoundToInt(
                 GetParam("spawn_reserve_segments", spawnReserveSegments));
@@ -337,6 +412,17 @@ namespace CrawlerParkour
         /// The flat path is kept so those two runs stay reproducible from their own
         /// configs -- a config that silently means something different than it did when
         /// it ran destroys the comparison the whole run existed to make.
+        ///
+        /// RUN 009 ADDS referenceRateScale, AND IT IS NOT A TUNING KNOB. Section 10.1
+        /// established that ReferenceRate measures the terrain and the physics
+        /// together and must be re-measured whenever either moves; the way it is
+        /// re-measured is to run the previous run's final policy at every rung. Run
+        /// 009 changes the ACTION SPACE, so there is no previous policy that can be
+        /// run at all -- the calibration procedure the rule depends on does not exist
+        /// for this run. The curve therefore launches as run 008's, known to be wrong
+        /// by an unknown factor, and this scalar is what lets the error be corrected
+        /// from RateAtLevel a few million steps in without rebuilding the Linux
+        /// player. Being an environment parameter, a --resume can change it.
         /// </remarks>
         public void GetGates(int level, out float promote, out float demote)
         {
@@ -346,7 +432,8 @@ namespace CrawlerParkour
                 demote = demoteSpeed;
                 return;
             }
-            float reference = ReferenceRate[Mathf.Clamp(level, 0, Levels - 1)];
+            float reference =
+                ReferenceRate[Mathf.Clamp(level, 0, Levels - 1)] * Mathf.Max(0f, referenceRateScale);
             promote = promoteFraction * reference;
             demote = demoteFraction * reference;
         }
@@ -368,6 +455,7 @@ namespace CrawlerParkour
             agent.respawnPenalty = respawnPenalty;
             agent.velocityPerSecond = velocityPerSecond;
             agent.targetSpeed = targetSpeed;
+            agent.airbornePerSecond = airbornePerSecond;
             agent.MaxStepOverride = maxEpisodeSteps;
 
             // Control costs ramp in with the curriculum instead of being charged in
@@ -491,6 +579,23 @@ namespace CrawlerParkour
             m_Stats.Add("CrawlerParkour/EnergyCost", agent.EpisodeEnergyCost);
             m_Stats.Add("CrawlerParkour/ActionRateCost", agent.EpisodeActionRateCost);
             m_Stats.Add("CrawlerParkour/VelocityReward", agent.EpisodeVelocityReward);
+
+            // ---- Run 009's two new actuators, made falsifiable ----
+            //
+            // Both changes this run makes to the animal are easy to ship and
+            // impossible to judge from reward alone: a policy that never lifts all
+            // four feet and a policy that never moves a friction command both look
+            // exactly like a policy that is merely not very good yet. These are the
+            // series that separate "the mechanism did not help" from "the mechanism
+            // was never used", which is the distinction run 008 could not make about
+            // the doubled joint drive.
+            m_Stats.Add("CrawlerParkour/AirborneFraction", agent.AirborneFraction);
+            m_Stats.Add("CrawlerParkour/AirborneReward", agent.EpisodeAirborneReward);
+            m_Stats.Add("CrawlerParkour/FootFriction", agent.MeanFootFriction);
+            // The mean alone cannot tell "holds everything at half grip" from
+            // "releases two feet hard while gripping with two" -- they are the same
+            // number and opposite behaviours.
+            m_Stats.Add("CrawlerParkour/FootRelease", agent.FootReleaseFraction);
             // Read this before reward. Run 002's reward rose by a full point while
             // the crawler was motionless, so mean speed is the term that says
             // whether anything is actually happening.
@@ -509,6 +614,17 @@ namespace CrawlerParkour
             // window (sum of counts / sum of entries), rather than an average of
             // per-episode ratios that would weight a one-segment episode as heavily
             // as a ten-segment one.
+            // ...and the SAME samples conditioned on the rung, which is the form that
+            // can actually be read during the run. See k_ClearedAtLevelKeys: run 008's
+            // marginal series said nine of ten obstacles got worse and the conditioned
+            // ones said nine of ten got better, off identical data.
+            //
+            // The level is the arena's CURRENT rung, which is the rung every segment
+            // in this episode was generated at -- ResetEpisode fixes the difficulty
+            // for the whole episode before the track is built, and UpdateTerrainLevel
+            // does not run until after this method. So the condition is exact rather
+            // than approximate.
+            int level = Mathf.Clamp(m_Level, 0, Levels - 1);
             int patterns = Mathf.Min(CrawlerParkourAgent.PatternCount, k_ClearedKeys.Length);
             for (int p = 0; p < patterns; p++)
             {
@@ -516,10 +632,18 @@ namespace CrawlerParkour
                 if (entered <= 0) continue;
                 float clearedShare = agent.SegmentsCleared[p] / (float)entered;
                 float fallShare = agent.SegmentFalls[p] / (float)entered;
+                // `entered` samples each, so the window MEAN is the pooled rate over
+                // every episode and arena in the window rather than an average of
+                // per-episode ratios -- a one-segment episode must not weigh as much
+                // as a ten-segment one. Same weighting in both forms, so the
+                // conditioned series aggregate back to the marginal one.
                 for (int i = 0; i < entered; i++)
                 {
                     m_Stats.Add(k_ClearedKeys[p], clearedShare);
                     m_Stats.Add(k_FallKeys[p], fallShare);
+                    m_Stats.Add(k_ClearedAtLevelKeys[p][level], clearedShare);
+                    m_Stats.Add(k_FallAtLevelKeys[p][level], fallShare);
+                    m_Stats.Add(k_ClearedLevelKeys[p], level);
                 }
             }
         }

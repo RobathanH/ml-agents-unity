@@ -8,9 +8,14 @@ namespace CrawlerParkour
 {
     /// <summary>
     /// Crawler that runs a procedurally generated obstacle track for time.
-    /// Action space matches CrawlerSumo (20 continuous: 12 joint targets, 8
-    /// strengths) so run 013's control-cost findings carry over unchanged.
     /// </summary>
+    /// <remarks>
+    /// RUN 009 widens the action space from 20 to 24. The first twenty are
+    /// unchanged in meaning and order -- 12 joint targets then 8 strengths, which
+    /// is CrawlerSumo's layout, so run 013's control-cost findings still carry --
+    /// and the four new ones command the friction of each foot independently. See
+    /// <see cref="FootFrictionMax"/> for the arithmetic and DESIGN.md 11.
+    /// </remarks>
     [RequireComponent(typeof(JointDriveController))]
     public class CrawlerParkourAgent : Agent
     {
@@ -58,10 +63,80 @@ namespace CrawlerParkour
         [System.NonSerialized] public float velocityPerSecond = 0.0167f;
         [System.NonSerialized] public float targetSpeed = 2.5f;
 
+        /// <summary>Reward per second with every foot clear of the ground. Run 009's
+        /// answer to the last surviving Gap hypothesis; see
+        /// <see cref="ApplyAirborneReward"/>.</summary>
+        [System.NonSerialized] public float airbornePerSecond;
+
+        // ------------------------------------------------------------- actions
+        //
+        // The first twenty are run 008's, unchanged in order and meaning. Friction
+        // is APPENDED rather than interleaved so that expanding a run 008 checkpoint
+        // onto this action space is a pure append on the output head, with the
+        // existing rows left where they are.
+
+        /// <summary>8 upper-leg (x, y) + 4 lower-leg (x) joint targets.</summary>
+        public const int NumJointTargetActions = 12;
+        /// <summary>Per-joint drive strengths, one per actuated joint.</summary>
+        public const int NumStrengthActions = 8;
+        /// <summary>Per-foot friction commands. Run 009.</summary>
+        public const int NumFrictionActions = 4;
+
+        public const int FirstStrengthAction = NumJointTargetActions;
+        public const int FirstFrictionAction = NumJointTargetActions + NumStrengthActions;
+        public const int ActionCount =
+            NumJointTargetActions + NumStrengthActions + NumFrictionActions;
+
+        // ----------------------------------------------------------- friction
+        //
+        // WHAT THE NUMBER 1.375 IS, because it looks arbitrary and is not.
+        //
+        // Run 008's crawler carried no physics material at all, so every contact
+        // paired the track's ParkourGround (1.6) with Unity's implicit default
+        // (0.6) under Average combine: a contact coefficient of 1.1. The foot
+        // materials created here use MULTIPLY combine, which wins over Average
+        // because Unity resolves a pair by the higher combine enum -- so the
+        // contact coefficient becomes GroundFriction * (what the agent commands).
+        //
+        // The brief was "0 to twice the current friction", i.e. contact in
+        // [0, 2.2], so the commanded multiplier spans [0, 2.2 / 1.6] = [0, 1.375].
+        // Which makes the midpoint 0.6875, and 1.6 * 0.6875 = 1.1 EXACTLY -- the
+        // run 008 contact. A zero action is therefore not a neutral-ish default,
+        // it is bit-for-bit the old physics, which is what makes it meaningful to
+        // initialise the four new policy outputs at zero and claim the warm start
+        // is behaviourally identical at launch.
+        //
+        // Kept next to the runtime that consumes it rather than in the builder,
+        // because the materials are created per agent at run time -- see
+        // SetupFrictionMaterials for why they cannot be shared assets.
+        public const float GroundFriction = 1.6f;
+        private const float k_UnityDefaultFriction = 0.6f;
+        /// <summary>Contact coefficient run 008 actually ran, Average combine.</summary>
+        public const float Run008ContactFriction =
+            (GroundFriction + k_UnityDefaultFriction) * 0.5f;
+        /// <summary>Largest multiplier a foot may command: twice run 008's contact.</summary>
+        public const float FootFrictionMax = 2f * Run008ContactFriction / GroundFriction;
+
+        /// <summary>
+        /// Fixed multiplier for every collider that is NOT a foot -- the body, its
+        /// decoration, and the four upper legs.
+        /// </summary>
+        /// <remarks>
+        /// These surfaces are not meant to be pushed against; when they touch
+        /// terrain the crawler is scraping, and grip there is what turns a scrape
+        /// into a snag. 0.15 x 1.6 = 0.24 contact, against 1.1 in run 008, so a
+        /// belly or a thigh resting on an edge now slides off it.
+        ///
+        /// Deliberately not zero. A frictionless body cannot brace against a wall
+        /// at all, and bellying over a hurdle -- one of the behaviours this
+        /// environment exists to produce -- needs the torso to purchase something.
+        /// </remarks>
+        public const float BodyFriction = 0.15f;
+
         /// <summary>
         /// Everything CollectObservations writes outside the height field:
         /// 6 orientation (up, forward in the yaw frame) + 6 velocity + 1 height
-        /// above ground + 4 foot contacts + 5 track-relative + 20 previous actions.
+        /// above ground + 4 foot contacts + 3 track-relative + 24 previous actions.
         /// </summary>
         /// <remarks>
         /// Here rather than in the scene builder because it has to track the body
@@ -69,16 +144,17 @@ namespace CrawlerParkour
         /// BehaviorParameters declaring more floats than the agent writes pads the
         /// tail with zeros and trains anyway.
         ///
-        /// Run 006 retires two of the five track-relative slots (see
-        /// CollectObservations) but keeps WRITING them, as constant zero. Deleting
-        /// them would take this from 42 to 40, change ObservationCount, and make run
-        /// 005's 68M-step checkpoint incompatible on the first layer of the vector
-        /// encoder AND on the running observation normaliser. A constant input is
-        /// just a bias shift that PPO absorbs in a few thousand steps, so the cheap
-        /// version buys the same behaviour for none of the risk. Delete them
-        /// properly at the next architecture change.
+        /// Run 006 retired two of the five track-relative slots but kept WRITING
+        /// them as constant zero, because deleting them would have changed this
+        /// count and broken run 005's checkpoint on both the first layer of the
+        /// vector encoder and the running observation normaliser. The note left
+        /// there said to delete them properly at the next architecture change.
+        ///
+        /// RUN 009 IS THAT CHANGE. The action space widens to 24, which moves the
+        /// previous-action block and the encoder's input width anyway, so the two
+        /// dead slots cost something to keep and nothing to remove. 42 -> 44.
         /// </remarks>
-        public const int NonGridObservations = 6 + 6 + 1 + 4 + 5 + 20;
+        public const int NonGridObservations = 6 + 6 + 1 + 4 + 3 + ActionCount;
 
         /// <summary>Total vector observation size, for BehaviorParameters.</summary>
         public int ObservationCount => NonGridObservations + 2 * GridForward * GridLateral;
@@ -92,6 +168,24 @@ namespace CrawlerParkour
         public float EpisodeEnergyCost { get; private set; }
         public float EpisodeActionRateCost { get; private set; }
         public float EpisodeVelocityReward { get; private set; }
+        public float EpisodeAirborneReward { get; private set; }
+
+        /// <summary>Fraction of this episode's decisions with all four feet clear of
+        /// the ground. The measure that says whether run 009's air-phase price
+        /// bought any air; without it the term is unfalsifiable.</summary>
+        public float AirborneFraction => m_Decisions > 0 ? m_AirborneDecisions / (float)m_Decisions : 0f;
+
+        /// <summary>Mean commanded friction multiplier over every foot and decision.
+        /// A policy that ignores the new actuator sits at
+        /// <see cref="FootFrictionMax"/>/2; one that has learned to release its feet
+        /// sits below it.</summary>
+        public float MeanFootFriction => m_Decisions > 0 ? m_FrictionSum / (m_Decisions * (float)NumFrictionActions) : 0f;
+
+        /// <summary>Fraction of foot-decisions commanding near-zero grip. Separated
+        /// from the mean because "releases two feet hard while gripping with two" and
+        /// "holds everything at half" are the same average and completely different
+        /// behaviours.</summary>
+        public float FootReleaseFraction => m_Decisions > 0 ? m_ReleaseCount / (m_Decisions * (float)NumFrictionActions) : 0f;
 
         /// <summary>Track-space z the episode started at. Run 006 spawns in the
         /// middle of the track, so this is no longer ~0 and every distance measure
@@ -119,7 +213,6 @@ namespace CrawlerParkour
         /// </summary>
         public float MeanForwardSpeed => m_Decisions > 0 ? m_ForwardSpeedSum / m_Decisions : 0f;
 
-        private const int k_NumStrengthActions = 8;
         private JointDriveController m_Jd;
         private float[] m_PrevActions;
         private bool m_HasPrevActions;
@@ -129,6 +222,12 @@ namespace CrawlerParkour
         private float m_DecisionSeconds = 0.02f;
         private float m_ForwardSpeedSum;
         private int m_Decisions;
+        private int m_AirborneDecisions;
+        private float m_FrictionSum;
+        private int m_ReleaseCount;
+        // One material per foot, owned by THIS agent. See SetupFrictionMaterials.
+        private PhysicsMaterial[] m_FootMaterials;
+        private PhysicsMaterial m_BodyMaterial;
         // Highest segment index the agent has ENTERED and the highest it has fully
         // cleared, so each segment is counted exactly once however many times the
         // agent crosses back over the boundary after a fall.
@@ -176,6 +275,116 @@ namespace CrawlerParkour
                         + "carry the rest; re-parenting breaks every spawn and respawn.");
                 }
             }
+
+            SetupFrictionMaterials();
+        }
+
+        /// <summary>
+        /// Gives this agent its own mutable friction on each foot, and pins every
+        /// other collider it owns to <see cref="BodyFriction"/>.
+        /// </summary>
+        /// <remarks>
+        /// PER AGENT, AT RUN TIME, and neither half of that is a style choice.
+        ///
+        /// Per agent: 32 arenas share one prefab, so a material assigned in the
+        /// builder is ONE asset behind 32 crawlers. Writing to it from
+        /// OnActionReceived would make every arena's feet carry the last friction
+        /// any arena commanded -- 31 agents acting on another agent's policy
+        /// output, which trains perfectly happily and means nothing. Assigning
+        /// `sharedMaterial` a freshly constructed instance is what keeps the
+        /// actuator private.
+        ///
+        /// At run time: a .physicMaterial asset per foot per arena is 128 assets
+        /// to keep in step with two constants, and the builder would have to
+        /// rewrite them all on every rebuild. The constants live here, next to the
+        /// code that reads them, for the same reason ObservationCount does.
+        ///
+        /// MULTIPLY combine is what makes the command mean something absolute.
+        /// Unity resolves a contact with the HIGHER of the two materials' combine
+        /// modes, and ParkourGround is Average (0) while this is Multiply (2), so
+        /// this side wins every contact against the track: the coefficient is
+        /// GroundFriction x the multiplier, on the floor, on a hurdle and on a
+        /// beam alike. Under Average the same command would have meant a different
+        /// grip on every surface, and under Minimum the top of the range would have
+        /// been clamped to the track's own 1.6 and the agent could never grip
+        /// harder than the ground it stands on.
+        /// </remarks>
+        private void SetupFrictionMaterials()
+        {
+            m_BodyMaterial = new PhysicsMaterial("CrawlerBody")
+            {
+                dynamicFriction = BodyFriction,
+                staticFriction = BodyFriction,
+                bounciness = 0f,
+                frictionCombine = PhysicsMaterialCombine.Multiply,
+                bounceCombine = PhysicsMaterialCombine.Average,
+                hideFlags = HideFlags.HideAndDontSave,
+            };
+
+            m_FootMaterials = new PhysicsMaterial[m_Feet.Length];
+            for (int i = 0; i < m_Feet.Length; i++)
+            {
+                m_FootMaterials[i] = new PhysicsMaterial($"CrawlerFoot{i}")
+                {
+                    // Midpoint = run 008's contact exactly, so an agent that has not
+                    // learned to use the actuator yet is running the old physics.
+                    dynamicFriction = FootFrictionMax * 0.5f,
+                    staticFriction = FootFrictionMax * 0.5f,
+                    bounciness = 0f,
+                    frictionCombine = PhysicsMaterialCombine.Multiply,
+                    bounceCombine = PhysicsMaterialCombine.Average,
+                    hideFlags = HideFlags.HideAndDontSave,
+                };
+            }
+
+            // Every collider under the agent gets one or the other. Walking the
+            // whole hierarchy rather than the nine body parts on purpose: the
+            // example crawler carries decoration with a collider (the sweatband,
+            // welded to the torso and therefore part of what scrapes along an
+            // overhang), and anything else added later would otherwise silently
+            // keep Unity's 0.6 default and be the grippiest surface on the animal.
+            int feet = 0, others = 0;
+            foreach (var col in GetComponentsInChildren<Collider>(true))
+            {
+                if (col.isTrigger) continue;
+                int footIndex = System.Array.FindIndex(
+                    m_Feet, f => f != null && col.transform.IsChildOf(f));
+                if (footIndex >= 0)
+                {
+                    col.sharedMaterial = m_FootMaterials[footIndex];
+                    feet++;
+                }
+                else
+                {
+                    col.sharedMaterial = m_BodyMaterial;
+                    others++;
+                }
+            }
+
+            // A foot with no collider is a foot whose friction command does nothing,
+            // and the run would look like the actuator simply did not help.
+            if (feet < m_Feet.Length)
+            {
+                Debug.LogError(
+                    $"{name}: only {feet} foot collider(s) found for {m_Feet.Length} feet. "
+                    + "The friction actions on the missing ones are inert -- the policy "
+                    + "will be paying an action-rate cost for an actuator that is not "
+                    + "connected to anything.");
+            }
+            Debug.Log($"{name}: friction materials -- {feet} foot collider(s) controllable "
+                      + $"in [0, {FootFrictionMax:F3}] x ground, {others} pinned at {BodyFriction}");
+        }
+
+        private void OnDestroy()
+        {
+            if (m_FootMaterials != null)
+            {
+                foreach (var m in m_FootMaterials)
+                {
+                    if (m != null) Destroy(m);
+                }
+            }
+            if (m_BodyMaterial != null) Destroy(m_BodyMaterial);
         }
 
         /// <summary>
@@ -243,8 +452,12 @@ namespace CrawlerParkour
             EpisodeEnergyCost = 0f;
             EpisodeActionRateCost = 0f;
             EpisodeVelocityReward = 0f;
+            EpisodeAirborneReward = 0f;
             m_ForwardSpeedSum = 0f;
             m_Decisions = 0;
+            m_AirborneDecisions = 0;
+            m_FrictionSum = 0f;
+            m_ReleaseCount = 0;
         }
 
         /// <summary>
@@ -291,31 +504,36 @@ namespace CrawlerParkour
 
             // Track-relative situation: LATERAL only.
             //
-            // The last two slots used to be Clamp01(z / TrackLength) and
+            // Two more slots used to sit here, Clamp01(z / TrackLength) and
             // Clamp01(MaxProgress / TrackLength) -- "how far through the track am
-            // I". That is goal-conditioning on a goal run 006 removes, and with a
+            // I". That is goal-conditioning on a goal run 006 removed, and with a
             // mid-track spawn it is worse than useless: it is a feature the policy
             // can key absolute track position on, which is exactly the dependence
-            // "keep moving at any point in any track" is meant to break. Held at
-            // zero rather than deleted so the observation vector keeps its shape and
-            // run 005's checkpoint stays loadable -- see NonGridObservations.
+            // "keep moving at any point in any track" is meant to break. Run 006
+            // held them at zero rather than deleting them so run 005's checkpoint
+            // stayed loadable. Run 009 changes the width of this vector anyway, so
+            // they are gone -- see NonGridObservations.
             float halfW = track != null ? track.TrackWidth * 0.5f : 1f;
             float laneX = track != null ? track.LaneCenterAt(tp.z) : 0f;
             sensor.AddObservation(Mathf.Clamp((tp.x - laneX) / 5f, -2f, 2f));
             sensor.AddObservation(Mathf.Clamp((halfW - tp.x) / 5f, -2f, 2f));
             sensor.AddObservation(Mathf.Clamp((tp.x + halfW) / 5f, -2f, 2f));
-            sensor.AddObservation(0f);
-            sensor.AddObservation(0f);
 
             AddHeightField(sensor);
 
+            // Previous actions, INCLUDING the four friction commands. Those four are
+            // the only place the policy can read what its feet are currently doing:
+            // friction is a property of a material, not a measurable state, and
+            // nothing else in the observation reflects it. Without them the policy
+            // would be charged an action-rate cost for changing a quantity it cannot
+            // observe.
             if (m_PrevActions != null)
             {
                 foreach (var a in m_PrevActions) sensor.AddObservation(a);
             }
             else
             {
-                for (int i = 0; i < 20; i++) sensor.AddObservation(0f);
+                for (int i = 0; i < ActionCount; i++) sensor.AddObservation(0f);
             }
         }
 
@@ -365,6 +583,14 @@ namespace CrawlerParkour
             var c = actionBuffers.ContinuousActions;
             int i = -1;
 
+            // ONE place, at the top. Four per-episode fractions divide by this
+            // (MeanForwardSpeed, AirborneFraction, MeanFootFriction,
+            // FootReleaseFraction) and their numerators are accumulated by three
+            // different methods further down; incrementing it inside one of those,
+            // as the velocity reward used to, makes every other fraction depend on
+            // the order the rewards happen to be applied in.
+            m_Decisions++;
+
             bp[leg0Upper].SetJointTargetRotation(c[++i], c[++i], 0);
             bp[leg1Upper].SetJointTargetRotation(c[++i], c[++i], 0);
             bp[leg2Upper].SetJointTargetRotation(c[++i], c[++i], 0);
@@ -383,9 +609,116 @@ namespace CrawlerParkour
             bp[leg2Lower].SetJointStrength(c[++i]);
             bp[leg3Lower].SetJointStrength(c[++i]);
 
+            ApplyFootFriction(c);
+
             ApplyVelocityReward();
+            ApplyAirborneReward();
             ApplyProgressReward();
             ApplyControlCosts(c);
+        }
+
+        /// <summary>
+        /// Sets each foot's friction from its own action, in [0, FootFrictionMax].
+        /// </summary>
+        /// <remarks>
+        /// This is run 009's answer to the failure mode the rollouts kept showing:
+        /// a foot wedged behind a ledge or dropped into a gap, with the policy
+        /// unable to retract it because the only way out was to drag it sideways
+        /// against 1.1 of grip. Grip is not a property of the terrain to be endured;
+        /// it is now a thing the animal decides, per foot, ten times a second. The
+        /// same knob is what a leap needs at the other end -- push against the
+        /// ground hard, then let go of it.
+        ///
+        /// Writing dynamicFriction is cheap but not free (PhysX re-reads the
+        /// material for existing contacts), so a command that has not moved is not
+        /// re-applied. The deadband is a thousandth of the range: far below
+        /// anything the policy can act on deliberately, far above float noise.
+        /// </remarks>
+        private void ApplyFootFriction(ActionSegment<float> c)
+        {
+            if (m_FootMaterials == null) return;
+            const float deadband = FootFrictionMax * 0.001f;
+
+            for (int f = 0; f < m_FootMaterials.Length; f++)
+            {
+                float a = Mathf.Clamp(c[FirstFrictionAction + f], -1f, 1f);
+                float mu = (a + 1f) * 0.5f * FootFrictionMax;
+
+                m_FrictionSum += mu;
+                // "Released" = under a tenth of the range. At 0.1375 x 1.6 = 0.22
+                // contact the foot slides out of anything it is caught in.
+                if (mu < FootFrictionMax * 0.1f) m_ReleaseCount++;
+
+                var mat = m_FootMaterials[f];
+                if (mat == null || Mathf.Abs(mat.dynamicFriction - mu) < deadband) continue;
+                mat.dynamicFriction = mu;
+                mat.staticFriction = mu;
+            }
+        }
+
+        /// <summary>
+        /// Pays per second with every foot clear of the ground, at the same speed
+        /// and heading shaping as the velocity term.
+        /// </summary>
+        /// <remarks>
+        /// RUN 009. Run 008 eliminated three explanations for `Gap` staying at
+        /// 0.7-3.1% cleared -- not training duration (+0.1 to +0.8 over 33M extra
+        /// steps), not actuation (doubling the joint drive moved it by nothing),
+        /// not exploration in the crude sense (falls per entry 0.02: the crawler
+        /// walks to the edge and stops). What was left is structural. Every
+        /// positive term in this environment is a rate against ground covered or
+        /// seconds of good locomotion, and a leap is neither: it is a second in
+        /// which no foot can push, no new metre is guaranteed, and a failure costs
+        /// a respawn plus the walk back over ground the ratchet has already paid
+        /// for. Stopping at the edge is not the policy being timid, it is the
+        /// policy being right about the reward it was given.
+        ///
+        /// So the air phase gets a price. Deliberately shaped by the SAME speed
+        /// and heading factors as ApplyVelocityReward rather than paid flat, and
+        /// that is what closes the obvious exploits:
+        ///
+        ///   - hopping on the spot earns nothing, because the speed factor is zero
+        ///     at zero down-track velocity;
+        ///   - so does being launched backwards off a hurdle, for the same reason;
+        ///   - and throwing itself off the track to farm airtime earns nothing
+        ///     either, because of the guard below: once the body is under the local
+        ///     ground line it is falling, not flying, and falling is already priced
+        ///     by respawnPenalty.
+        ///
+        /// What is left that this pays for is a foot-free second spent travelling
+        /// forwards -- which is a leap, or the flight phase of a bound. Both are
+        /// what the environment exists to produce.
+        /// </remarks>
+        private void ApplyAirborneReward()
+        {
+            bool airborne = true;
+            for (int i = 0; i < m_Feet.Length; i++)
+            {
+                var gc = m_Jd.bodyPartsDict[m_Feet[i]].groundContact;
+                if (gc != null && gc.touchingGround) { airborne = false; break; }
+            }
+
+            // Below the local ground line is a fall in progress, not a leap. Checked
+            // against the same height field HasFallen uses, so the two agree about
+            // what "under the track" means.
+            if (airborne && track != null)
+            {
+                var tp = TrackPos;
+                if (track.GroundHeightAt(tp.x, tp.z, out float g) && tp.y < g) airborne = false;
+            }
+
+            if (!airborne) return;
+            m_AirborneDecisions++;
+            if (airbornePerSecond <= 0f || targetSpeed <= 0f) return;
+
+            float vz = AvgVelocity().z;
+            float d = Mathf.Clamp(Mathf.Abs(vz - targetSpeed), 0f, targetSpeed) / targetSpeed;
+            float speed = (1f - d * d) * (1f - d * d);
+            float heading = (body.forward.z + 1f) * 0.5f;
+
+            float r = airbornePerSecond * m_DecisionSeconds * speed * heading;
+            AddReward(r);
+            EpisodeAirborneReward += r;
         }
 
         /// <summary>
@@ -425,7 +758,6 @@ namespace CrawlerParkour
             // (ToTrack/ToWorld), so a world-space direction is already track-space.
             float vz = AvgVelocity().z;
             m_ForwardSpeedSum += vz;
-            m_Decisions++;
 
             // Speed is accounted above this guard, not below it: MeanForwardSpeed is
             // the stat that tells run 002's failure apart from real progress, and an
@@ -520,14 +852,23 @@ namespace CrawlerParkour
 
             if (energyCostWeight > 0f || actionRateCostWeight > 0f)
             {
+                // The strength block, by INDEX, not by "the last eight".
+                //
+                // It was `n - k_NumStrengthActions` while the strengths happened to
+                // be the tail of the vector. Run 009 appends four friction commands
+                // after them, so that expression would have averaged four strengths
+                // and four frictions and called the result energy -- charging the
+                // agent for gripping and refunding it for letting go, at the same
+                // weight as joint torque, with nothing in any metric to show for it.
+                int start = Mathf.Clamp(FirstStrengthAction, 0, n);
+                int end = Mathf.Clamp(FirstStrengthAction + NumStrengthActions, start, n);
                 float energy = 0f;
-                int start = Mathf.Max(0, n - k_NumStrengthActions);
-                for (int a = start; a < n; a++)
+                for (int a = start; a < end; a++)
                 {
                     float s = (c[a] + 1f) * 0.5f;
                     energy += s * s;
                 }
-                energy = (n - start) > 0 ? energy / (n - start) : 0f;
+                energy = (end - start) > 0 ? energy / (end - start) : 0f;
 
                 float rate = 0f;
                 if (m_HasPrevActions)

@@ -148,28 +148,60 @@ public static class CrawlerParkourBuilder
     }
 
     /// <summary>
-    /// Friction 0.8. The generator's steepest ramp is 40 degrees and the ceiling
-    /// for a ramp that can be walked up is arctan(mu) = 38.7 degrees at mu=0.8,
-    /// so this material is part of the feasibility guarantee rather than a
-    /// cosmetic choice -- a slippier one makes the hardest ramps unclimbable and
-    /// the generator has no way to detect it.
-    /// </summary>
-    /// <summary>
-    /// Ground and obstacle friction. Run 008 doubled this from 0.8.
+    /// Ground and obstacle friction. Run 008 doubled this from 0.8; the
+    /// generator's steepest ramp is 40 degrees against a walkable ceiling of
+    /// arctan(mu), so it is part of the feasibility guarantee rather than a
+    /// cosmetic choice.
     /// </summary>
     /// <remarks>
-    /// The crawler's own colliders carry no physics material, so Unity pairs this
-    /// with the project default (0.6) and FrictionCombine is Average -- the CONTACT
-    /// coefficient is therefore (1.6 + 0.6) / 2 = 1.1, up from 0.7, not 1.6. Doubling
-    /// the material doubles the material; it does not double the contact. Assign this
-    /// material to the crawler's foot colliders, or switch the combine mode, if the
-    /// full factor is wanted.
-    ///
-    /// Kept here as a named constant because it lives in two places -- this builder
-    /// and the checked-in .physicMaterial asset -- and a rebuild silently overwrites
-    /// the asset with whatever this says.
+    /// Read from the AGENT rather than declared here. Run 008's note said this
+    /// number lives in two places -- this builder and the checked-in
+    /// .physicMaterial asset, which a rebuild silently overwrites -- and run 009
+    /// gives it a third reader: the foot friction range is expressed as a
+    /// multiplier on it (CrawlerParkourAgent.FootFrictionMax), so the two must
+    /// agree or the "0 to twice run 008's contact" arithmetic is simply wrong.
+    /// One constant, and the asset is derived from it.
     /// </remarks>
-    const float GroundFriction = 1.6f;
+    const float GroundFriction = CrawlerParkourAgent.GroundFriction;
+
+    // -------------------------------------------------------------- rig physics
+    //
+    // RUN 008 SET THESE BY HAND ON THE PREFAB AND THE BUILDER DID NOT KNOW.
+    // BuildEnvPrefab re-instantiates the example Crawler on every run, and the
+    // example ships 40000/5000/20000 -- so `BuildAll` would have quietly halved the
+    // joint drive of the run under test and rewritten the prefab with it, and the
+    // only evidence would have been a policy that suddenly could not climb. The
+    // values are here now, applied explicitly, for the same reason GroundFriction is.
+    const float MaxJointSpring = 80000f;
+    const float JointDampen = 10000f;
+    const float MaxJointForceLimit = 40000f;
+
+    // ----------------------------------------------------------- joint ranges
+    //
+    // RUN 009. The example crawler's legs are hinged for walking on a floor, the
+    // right way up, and the limits say so: the hip swings [-60, 0] about X and the
+    // knee bends [0, 150]. Both ranges sit entirely on ONE SIDE of the joint's
+    // zero -- and a ConfigurableJoint's zero is the pose the rig was authored in --
+    // so the animal is mechanically incapable of doing anything on its back that it
+    // can do on its feet, and incapable of folding a leg in under its body at all.
+    // Every recovery from a tumble had to be a re-flip.
+    //
+    // Making each range symmetric about zero is what buys both: the leg can be
+    // driven as far one way as the other, so an inverted crawler has exactly the
+    // workspace an upright one has, and a hip that can reach +90 as well as -90 can
+    // tuck the whole limb underneath the torso.
+    //
+    // THE COST IS RESOLUTION, and it is worth stating plainly rather than
+    // discovering. SetJointTargetRotation lerps the action across the limit range,
+    // so tripling the hip's X range divides the angular precision of a unit of
+    // policy output by three. Foot placement on a Beam is exactly the skill that
+    // needs precision. Y is widened less than X for that reason -- the splay only
+    // has to reach under the body, not around it.
+    const float HipLowXLimit = -90f;
+    const float HipHighXLimit = 90f;
+    const float HipYLimit = 45f;
+    const float KneeLowXLimit = -150f;
+    const float KneeHighXLimit = 150f;
 
     static PhysicsMaterial EnsurePhysicsMaterial()
     {
@@ -320,6 +352,7 @@ public static class CrawlerParkourBuilder
             controller.progressPerMeter = 0.08f;
             controller.velocityPerSecond = 0.0167f;
             controller.targetSpeed = 2.5f;
+            controller.airbornePerSecond = 0.05f;
             controller.respawnPenalty = 0.5f;
             controller.energyCostWeight = 0.002f;
             controller.actionRateCostWeight = 0.002f;
@@ -327,6 +360,14 @@ public static class CrawlerParkourBuilder
             controller.initialLevel = 5;
             controller.promoteSpeed = 0.5f;
             controller.demoteSpeed = 0.15f;
+            // Set here as well as in the config from run 009 on. Left at the field
+            // initialiser (-1) a standalone build silently falls back to the flat
+            // promote/demote pair that ratcheted runs 006 and 007 to the ceiling, so
+            // any eval that let the curriculum run -- rather than pinning it -- would
+            // be watching a different curriculum than the one that trained.
+            controller.promoteFraction = 1.15f;
+            controller.demoteFraction = 0.85f;
+            controller.referenceRateScale = 1f;
             // Adaptive by default. An eval or viewer build pins the terrain with
             // --env-param difficulty_pin=<d>, which is the only way a standalone
             // build (no python side channel) can be made to run the terrain the
@@ -448,11 +489,19 @@ public static class CrawlerParkourBuilder
         }
         Debug.Log($"Cleared terminating/penalising ground contact on {cleared} body part(s)");
 
+        ConfigureJointDrive(crawler);
+        WidenLegJoints(agent);
+
         var behavior = crawler.GetComponent<BehaviorParameters>();
         behavior.BehaviorName = BehaviorName;
         behavior.BrainParameters.VectorObservationSize = VectorObservationSize(agent);
         behavior.BrainParameters.NumStackedVectorObservations = 1;
-        behavior.BrainParameters.ActionSpec = ActionSpec.MakeContinuous(20);
+        // From the agent's own constant, not a literal. A BehaviorParameters that
+        // declares more actions than OnActionReceived reads is not an error at any
+        // level -- the extra dimensions are simply sampled, costed by the action-rate
+        // term, and ignored.
+        behavior.BrainParameters.ActionSpec =
+            ActionSpec.MakeContinuous(CrawlerParkourAgent.ActionCount);
         behavior.Model = null;
         behavior.BehaviorType = BehaviorType.Default;
 
@@ -473,6 +522,81 @@ public static class CrawlerParkourBuilder
     /// produced a six-float discrepancy in the first place.
     /// </summary>
     static int VectorObservationSize(CrawlerParkourAgent agent) => agent.ObservationCount;
+
+    /// <summary>
+    /// Applies run 008's joint gains, which until now only existed as a hand edit
+    /// on the prefab this builder overwrites.
+    /// </summary>
+    static void ConfigureJointDrive(GameObject crawler)
+    {
+        var jd = crawler.GetComponent<Unity.MLAgentsExamples.JointDriveController>();
+        if (jd == null)
+        {
+            throw new Exception(
+                $"{crawler.name} has no JointDriveController; the example Crawler prefab "
+                + "is expected to carry one and the agent requires it.");
+        }
+        jd.maxJointSpring = MaxJointSpring;
+        jd.jointDampen = JointDampen;
+        jd.maxJointForceLimit = MaxJointForceLimit;
+        Debug.Log($"Joint drive: spring {MaxJointSpring}, dampen {JointDampen}, "
+                  + $"force limit {MaxJointForceLimit}");
+    }
+
+    /// <summary>
+    /// Makes every leg joint's angular range symmetric about its authored pose.
+    /// </summary>
+    /// <remarks>
+    /// Only `limit` is written. `bounciness` and `contactDistance` are read back out
+    /// of the existing SoftJointLimit and put back unchanged, because SoftJointLimit
+    /// is a struct: assigning a fresh one would silently zero both, and a zeroed
+    /// contactDistance means the solver only notices the limit once it has already
+    /// been violated, which reads as a leg that jitters at full extension.
+    ///
+    /// Y motion is asserted rather than assumed to be free on the hips. The action
+    /// space drives (x, y) on each upper leg, and if a future rig locks Y the policy
+    /// would keep paying an action-rate cost for a dimension that moves nothing --
+    /// the same class of silent no-op as an observation the config over-declares.
+    /// </remarks>
+    static void WidenLegJoints(CrawlerParkourAgent agent)
+    {
+        var hips = new[] { agent.leg0Upper, agent.leg1Upper, agent.leg2Upper, agent.leg3Upper };
+        var knees = new[] { agent.leg0Lower, agent.leg1Lower, agent.leg2Lower, agent.leg3Lower };
+
+        static SoftJointLimit With(SoftJointLimit existing, float limit)
+        {
+            existing.limit = limit;
+            return existing;
+        }
+
+        foreach (var t in hips)
+        {
+            var j = t.GetComponent<ConfigurableJoint>();
+            if (j == null) throw new Exception($"Hip '{t.name}' has no ConfigurableJoint");
+            j.lowAngularXLimit = With(j.lowAngularXLimit, HipLowXLimit);
+            j.highAngularXLimit = With(j.highAngularXLimit, HipHighXLimit);
+            j.angularYLimit = With(j.angularYLimit, HipYLimit);
+            if (j.angularYMotion != ConfigurableJointMotion.Limited)
+            {
+                throw new Exception(
+                    $"Hip '{t.name}' has angularYMotion = {j.angularYMotion}, not Limited. "
+                    + "The policy spends an action on this axis every decision; locked, "
+                    + "that action is charged for and does nothing.");
+            }
+        }
+
+        foreach (var t in knees)
+        {
+            var j = t.GetComponent<ConfigurableJoint>();
+            if (j == null) throw new Exception($"Knee '{t.name}' has no ConfigurableJoint");
+            j.lowAngularXLimit = With(j.lowAngularXLimit, KneeLowXLimit);
+            j.highAngularXLimit = With(j.highAngularXLimit, KneeHighXLimit);
+        }
+
+        Debug.Log(
+            $"Leg ranges: hip X [{HipLowXLimit}, {HipHighXLimit}] Y +/-{HipYLimit}, "
+            + $"knee X [{KneeLowXLimit}, {KneeHighXLimit}] -- symmetric about the authored pose");
+    }
 
     /// <summary>
     /// Wires the EGNN sensor. Its fields are private [SerializeField], so this
@@ -620,12 +744,30 @@ public static class CrawlerParkourBuilder
         const int subTypes = 5;
         var row = 3 + 4 + 3 + 3 + 3 + 3 + types + subTypes;
 
+        var jd = agent.GetComponent<Unity.MLAgentsExamples.JointDriveController>();
+        var hip = agent.leg0Upper.GetComponent<ConfigurableJoint>();
+        var knee = agent.leg0Lower.GetComponent<ConfigurableJoint>();
+
         Debug.Log(
             "CrawlerParkour build report\n"
             + $"  behavior name        : {behavior.BehaviorName}\n"
-            + $"  continuous actions   : {behavior.BrainParameters.ActionSpec.NumContinuousActions}\n"
+            + $"  continuous actions   : {behavior.BrainParameters.ActionSpec.NumContinuousActions}"
+            + $" ({CrawlerParkourAgent.NumJointTargetActions} targets,"
+            + $" {CrawlerParkourAgent.NumStrengthActions} strengths,"
+            + $" {CrawlerParkourAgent.NumFrictionActions} friction)\n"
             + $"  vector observations  : {behavior.BrainParameters.VectorObservationSize}"
             + $" (grid {agent.GridForward}x{agent.GridLateral})\n"
+            + $"  joint drive          : spring {jd.maxJointSpring}, dampen {jd.jointDampen},"
+            + $" force {jd.maxJointForceLimit}\n"
+            + $"  hip range            : X [{hip.lowAngularXLimit.limit},"
+            + $" {hip.highAngularXLimit.limit}] Y +/-{hip.angularYLimit.limit}\n"
+            + $"  knee range           : X [{knee.lowAngularXLimit.limit},"
+            + $" {knee.highAngularXLimit.limit}]\n"
+            + $"  friction             : ground {GroundFriction}, foot command"
+            + $" [0, {CrawlerParkourAgent.FootFrictionMax:F4}] x ground"
+            + $" = contact [0, {GroundFriction * CrawlerParkourAgent.FootFrictionMax:F3}],"
+            + $" body {CrawlerParkourAgent.BodyFriction} (run 008 contact was"
+            + $" {CrawlerParkourAgent.Run008ContactFriction:F3} everywhere)\n"
             + $"  EGNN entities        : {self} self + {MaxObstacles} obstacles = {self + MaxObstacles}\n"
             + $"  EGNN row width       : {row} (pos 3, quat 4, linvel 3, angvel 3,"
             + $" offset 3, extent 3, type {types}, subtype {subTypes})\n"
@@ -638,6 +780,266 @@ public static class CrawlerParkourBuilder
         {
             Debug.LogError("Vector observation size disagrees with CollectObservations");
         }
+    }
+
+    /// <summary>
+    /// Steps real PhysX and checks that the friction actuator run 009 adds is
+    /// connected to anything at all.
+    /// </summary>
+    /// <remarks>
+    /// EVERY OTHER PART OF THIS CHANGE CAN BE READ AND BELIEVED. This one cannot.
+    /// It rests on two claims about an engine, not about our code:
+    ///
+    ///   1. that a contact between a Multiply material and an Average one resolves
+    ///      as Multiply, so a foot's command means GroundFriction x itself rather
+    ///      than some average of the two;
+    ///   2. that writing `dynamicFriction` on a material a collider is ALREADY
+    ///      RESTING ON changes the force on the next step, rather than on the next
+    ///      time the contact is created.
+    ///
+    /// If (2) is false the whole feature still compiles, still logs, still shows a
+    /// policy learning to move the four new outputs -- and does nothing, because a
+    /// foot only ever gets the friction it happened to have when it landed. That is
+    /// a 24-hour run and roughly $31 to discover from a reward curve, and it would
+    /// most likely be read as "the actuator did not help".
+    ///
+    /// So it is measured against closed-form predictions instead. A block sliding on
+    /// a plane decelerates at mu*g, so distance to rest from v0 is v0^2 / (2*mu*g) --
+    /// arithmetic with no free parameters, which makes a wrong result unmistakable
+    /// rather than merely surprising. The last case is the one that matters: slide
+    /// frictionless for half a second, then write the material mid-slide. If the
+    /// write is ignored the block travels the full 5 m and the check fails loudly.
+    /// </remarks>
+    [MenuItem("Training/CrawlerParkour/Verify Friction Control")]
+    public static void VerifyFrictionControl()
+    {
+        var ok = true;
+        var previousMode = Physics.simulationMode;
+        var trash = new List<UnityEngine.Object>();
+        try
+        {
+            EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+            Physics.simulationMode = SimulationMode.Script;
+
+            const float dt = 0.02f;
+            const float v0 = 5f;
+            float g = Mathf.Abs(Physics.gravity.y);
+
+            // The track's own material, exactly as the box prefab carries it.
+            var ground = new PhysicsMaterial("ProbeGround")
+            {
+                dynamicFriction = GroundFriction,
+                staticFriction = GroundFriction,
+                bounciness = 0f,
+                frictionCombine = PhysicsMaterialCombine.Average,
+            };
+            trash.Add(ground);
+
+            var floor = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            trash.Add(floor);
+            floor.name = "ProbeFloor";
+            floor.transform.localScale = new Vector3(200f, 1f, 200f);
+            floor.transform.position = new Vector3(0f, -0.5f, 0f);
+            floor.GetComponent<BoxCollider>().sharedMaterial = ground;
+
+            const int maxSteps = 400;
+
+            // Slides a body and returns (metres travelled, mean deceleration while a
+            // constant friction was in force). `switchAt` < 0 holds mu0 throughout;
+            // otherwise mu1 is written at that time and the deceleration reported is
+            // the one AFTER the write, which is what makes the write observable.
+            (float travelled, float decel) Slide(
+                PrimitiveType shape, bool freezeRotation, float mu0, float mu1, float switchAt,
+                bool onSide = false)
+            {
+                var block = GameObject.CreatePrimitive(shape);
+                trash.Add(block);
+                block.name = "ProbeBlock";
+                // Resting height is per shape, and getting it wrong is not a small
+                // error: Unity's capsule primitive is 2 tall, so dropping it in at the
+                // box's 0.5 would bury half of it in the floor and measure a
+                // depenetration impulse rather than friction.
+                var halfHeight = shape == PrimitiveType.Capsule && !onSide ? 1f : 0.5f;
+                block.transform.position = new Vector3(0f, halfHeight, 0f);
+                if (onSide) block.transform.rotation = Quaternion.Euler(0f, 0f, 90f);
+                var rb = block.AddComponent<Rigidbody>();
+                if (freezeRotation) rb.constraints = RigidbodyConstraints.FreezeRotation;
+                rb.linearVelocity = new Vector3(0f, 0f, v0);
+
+                var mat = new PhysicsMaterial("ProbeFoot")
+                {
+                    dynamicFriction = mu0,
+                    staticFriction = mu0,
+                    bounciness = 0f,
+                    frictionCombine = PhysicsMaterialCombine.Multiply,
+                };
+                trash.Add(mat);
+                block.GetComponent<Collider>().sharedMaterial = mat;
+
+                float t = 0f, measureFrom = 0f, vAtMeasure = v0, vLast = v0, tLast = 0f;
+                var switched = switchAt < 0f;
+                for (var step = 0; step < maxSteps; step++)
+                {
+                    if (!switched && t >= switchAt)
+                    {
+                        mat.dynamicFriction = mu1;
+                        mat.staticFriction = mu1;
+                        switched = true;
+                        measureFrom = t;
+                        vAtMeasure = rb.linearVelocity.z;
+                    }
+                    Physics.Simulate(dt);
+                    t += dt;
+                    if (rb.linearVelocity.z > 0.02f) { vLast = rb.linearVelocity.z; tLast = t; }
+                    else break;
+                }
+                var travelled = block.transform.position.z;
+                var span = tLast - measureFrom;
+                var decel = span > 1e-4f ? (vAtMeasure - vLast) / span : 0f;
+                UnityEngine.Object.DestroyImmediate(block);
+                return (travelled, decel);
+            }
+
+            Debug.Log(
+                "Friction probe: a body launched at 5 m/s along a ParkourGround plane.\n"
+                + "  Coulomb says it decelerates at mu*g with mu = ground x command under "
+                + "Multiply combine,\n  and at (ground + command)/2 * g under Average -- which "
+                + "is what this is here to tell apart.");
+
+            var neutral = CrawlerParkourAgent.FootFrictionMax * 0.5f;
+            var full = CrawlerParkourAgent.FootFrictionMax;
+
+            // What PhysX actually charges, per unit of Coulomb, measured rather than
+            // assumed. See the block comment below the results for why it is not 1.
+            float Effective(string label, PrimitiveType shape, bool freeze, float mu,
+                            bool onSide = false)
+            {
+                var (d, a) = Slide(shape, freeze, mu, mu, -1f, onSide);
+                var coulomb = GroundFriction * mu * g;
+                var ratio = coulomb > 0f ? a / coulomb : 0f;
+                Debug.Log($"  {label}: command {mu:F4}, contact mu {GroundFriction * mu:F3}"
+                          + $" -> slid {d:F3} m, decelerating at {a:F2} m/s^2"
+                          + $" against a Coulomb {coulomb:F2} ({ratio:F2}x)");
+                return ratio;
+            }
+
+            float EffectiveTipped(string label, float mu)
+                => Effective(label, PrimitiveType.Capsule, true, mu, true);
+
+            // --- 1. Is the pair resolved as Multiply, or as Average? ---
+            //
+            // Asked as a RATIO, which is the form that does not depend on the constant
+            // measured below. Doubling the command doubles the contact under Multiply
+            // and multiplies it by only 1.30 under Average ((1.6+1.375)/2 over
+            // (1.6+0.6875)/2), so the two answers are far apart and nothing in between
+            // is a near miss.
+            var aNeutral = Slide(PrimitiveType.Cube, true, neutral, neutral, -1f).decel;
+            var aFull = Slide(PrimitiveType.Cube, true, full, full, -1f).decel;
+            var ratio = aNeutral > 0f ? aFull / aNeutral : 0f;
+            var multiplyOk = Mathf.Abs(ratio - 2f) <= 0.1f;
+            Debug.Log($"  doubling the command changed the deceleration by {ratio:F3}x"
+                      + $" (Multiply predicts 2.00, Average predicts 1.30)"
+                      + $" {(multiplyOk ? "ok" : "FAIL")}");
+            if (!multiplyOk)
+            {
+                ok = false;
+                Debug.LogError(
+                    $"The foot material is not winning the combine: doubling the command "
+                    + $"moved the contact by {ratio:F2}x, not 2x. Every friction number in "
+                    + "CrawlerParkourAgent is stated as GroundFriction x the command, and "
+                    + "under any other combine mode that arithmetic is simply wrong.");
+            }
+
+            // --- 2. Does a zero command really mean no grip? ---
+            //
+            // Under Average a released foot would still carry (1.6 + 0)/2 = 0.8 and
+            // stop inside two metres. The whole point of the actuator is that it can
+            // let go, so this is the case that has to be unambiguous.
+            var free = Slide(PrimitiveType.Cube, true, 0f, 0f, -1f).travelled;
+            var freeMax = v0 * maxSteps * dt;
+            var freeOk = free > 0.98f * freeMax;
+            Debug.Log($"  released (action -1): slid {free:F3} m of a frictionless "
+                      + $"{freeMax:F1} m {(freeOk ? "ok" : "FAIL")}");
+            if (!freeOk) ok = false;
+
+            // --- 3. THE ONE THAT MATTERS: written onto a material already in contact ---
+            //
+            // Frictionless for 0.5 s, then full grip written while the body is sliding.
+            // If PhysX only picks a material up when a contact is created, this
+            // deceleration is zero and the body runs to the end of the plane.
+            var (midD, midA) = Slide(PrimitiveType.Cube, true, 0f, full, 0.5f);
+            var midOk = aFull > 0f && Mathf.Abs(midA - aFull) / aFull <= 0.1f;
+            Debug.Log($"  written mid-slide: slid {midD:F3} m, decelerating at {midA:F2} m/s^2"
+                      + $" after the write against {aFull:F2} for a foot that had that grip "
+                      + $"all along {(midOk ? "ok" : "FAIL")}");
+            if (!midOk)
+            {
+                ok = false;
+                Debug.LogError(
+                    $"Writing dynamicFriction on a material ALREADY IN CONTACT did not take "
+                    + $"effect: {midA:F2} m/s^2 against {aFull:F2} for the same grip applied "
+                    + "before the slide began. The four friction actions would be decorative "
+                    + "-- a foot would only ever get the grip it happened to have when it "
+                    + "landed, and the run would read as 'the actuator did not help'.");
+            }
+
+            // --- 4. How much of Coulomb the solver actually charges, BY SHAPE ---
+            //
+            // The cases above all use a box, and a box lands at exactly 2.00x the
+            // textbook mu*g. That is not the engine being wrong and it is not our
+            // numbers being wrong -- it is PxFrictionType patch putting two friction
+            // anchors under a face-down contact and allowing each the full mu*N. A
+            // sphere, which touches at a point, comes back at exactly 1.00x.
+            //
+            // WHICH MEANS THE BOX FIGURE DOES NOT APPLY TO THE CRAWLER, and reporting
+            // it as if it did would have been the friction version of run 008's
+            // "doubling the material doubles the contact". Every collider on this
+            // animal is a capsule or a sphere; none of them is a face. So the capsule
+            // is measured too, in both orientations it actually meets terrain in --
+            // on its rounded end, which is a foot tip, and on its side, which is a leg
+            // lying flat -- and that is the number the design arithmetic rests on.
+            //
+            // It matters beyond bookkeeping: the generator's feasibility guarantee
+            // says a ramp is climbable below arctan(mu), and that bound is only true
+            // of the effective coefficient.
+            Effective("cube,    face down    ", PrimitiveType.Cube, true, neutral);
+            Effective("cube,    free to spin ", PrimitiveType.Cube, false, neutral);
+            Effective("sphere,  point contact", PrimitiveType.Sphere, true, neutral);
+            var footRatio = Effective("capsule, on its end  ", PrimitiveType.Capsule, true, neutral);
+            var legRatio = EffectiveTipped("capsule, on its side ", neutral);
+            Debug.Log(
+                $"  A capsule standing on its rounded end is charged {footRatio:F2}x Coulomb "
+                + $"and the same capsule lying on its side {legRatio:F2}x -- one anchor "
+                + "against two.\n"
+                + "  So contact mu as stated in CrawlerParkourAgent is exactly right for a "
+                + "foot placed on its tip, and DOUBLE for any limb lying along the ground.\n"
+                + $"  That asymmetry is the leg-snag mechanism measured: under run 008 a "
+                + $"foot got {CrawlerParkourAgent.Run008ContactFriction:F2} and a leg fallen "
+                + $"flat across an edge got {2f * CrawlerParkourAgent.Run008ContactFriction:F2}"
+                + ", the grippiest contact on the animal, on the part with no actuator to "
+                + "release it.\n"
+                + $"  Run 009 puts that limb at {CrawlerParkourAgent.BodyFriction:F2} x "
+                + $"{GroundFriction} x 2 = "
+                + $"{2f * CrawlerParkourAgent.BodyFriction * GroundFriction:F2} effective, a "
+                + $"{2f * CrawlerParkourAgent.Run008ContactFriction / (2f * CrawlerParkourAgent.BodyFriction * GroundFriction):F1}x "
+                + "reduction in what a scraping leg has to drag itself out of.");
+
+            Debug.Log(ok ? "FRICTION OK" : "FRICTION FAILED");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Friction probe threw: {e}");
+            ok = false;
+        }
+        finally
+        {
+            Physics.simulationMode = previousMode;
+            foreach (var o in trash)
+            {
+                if (o != null) UnityEngine.Object.DestroyImmediate(o);
+            }
+        }
+        ExitIfBatch(ok);
     }
 
     /// <summary>

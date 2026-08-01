@@ -12,34 +12,73 @@ launched; run 013 may still hold the one-instance budget.
    Unity.exe -batchmode -nographics -projectPath Project `
      -executeMethod CrawlerParkourBuilder.BuildAll -logFile build.log
    ```
-2. Both checks green:
+2. All three checks green:
    ```
    cd Project/Assets/CrawlerParkour/Tests~ && dotnet run -c Release   # ALL TRAVERSABLE
    Unity.exe -batchmode -nographics -projectPath Project `
      -executeMethod CrawlerParkourBuilder.VerifyMultiArena -logFile verify.log   # VERIFY OK
+   Unity.exe -batchmode -nographics -projectPath Project `
+     -executeMethod CrawlerParkourBuilder.VerifyFrictionControl -logFile fric.log # FRICTION OK
    ```
+   The friction probe steps real PhysX, and it is here because run 009's per-foot
+   friction rests on two claims about the **engine** rather than about our code:
+   that a Multiply material wins a contact against an Average one, and that
+   writing `dynamicFriction` on a material a foot is *already standing on* changes
+   the force on the next step rather than on the next time the contact is created.
+   If the second is false the feature compiles, logs, trains, and does nothing —
+   a foot would only ever get the grip it happened to have when it landed — and
+   the run reads as "the actuator did not help", 24 hours and $31 later.
 3. Linux build exported to `envs/CrawlerParkour_Multi_linux/` and archived as
    `envs/CrawlerParkour_Multi_linux.tgz`:
    ```
    Unity.exe -batchmode -nographics -projectPath Project `
      -executeMethod CrawlerParkourBuilder.BuildMultiLinux -logFile linux.log
    ```
-4. Branch `crawler-parkour` pushed, so the instance can clone it.
-5. The encoder's startup log line shows `vec_channels=7` with
+4. `python scripts/preflight_parkour.py` → PREFLIGHT OK. From run 009 this also
+   reads the **prefab**, because the action count, the observation width and every
+   joint limit live in serialised asset data — a prefab still declaring the old
+   rig passes a symbol check completely.
+5. Branch `crawler-parkour` pushed, so the instance can clone it.
+6. The encoder's startup log line shows `vec_channels=7` with
    `center_offset[13:16]` in the layout. This one can only be checked once
    training is running — it is the first thing to look at in the run log.
+
+## Warm starting across a rig change (run 009)
+
+Run 008's checkpoint does not fit run 009's network: 168 → 170 observations,
+20 → 24 actions, and joint limits that change what every existing action *means*.
+It is transformed rather than discarded — see DESIGN.md §11.8.
+
+```powershell
+python scripts\expand_checkpoint.py `
+  --src results\cloud_staging\CrawlerParkour_008\CrawlerParkour\checkpoint.pt `
+  --dst results\cloud_staging\CrawlerParkour_008_r009\CrawlerParkour\checkpoint.pt
+cd scripts; python verify_expanded_checkpoint.py `
+  --old ..\results\cloud_staging\CrawlerParkour_008\CrawlerParkour\checkpoint.pt `
+  --new ..\results\cloud_staging\CrawlerParkour_008_r009\CrawlerParkour\checkpoint.pt
+```
+
+Do not launch unless that prints `EXPANDED CHECKPOINT VERIFIED`. A wrong column
+offset produces a checkpoint that loads cleanly, trains happily, and is a
+scrambled policy.
 
 ## Launch
 
 ```powershell
 .\scripts\lambda\cloud_train.ps1 `
-  -RunId CrawlerParkour_001 `
-  -TimeLimitHours 8 `
+  -RunId CrawlerParkour_009 `
+  -TimeLimitHours 24 `
   -Branch crawler-parkour `
   -Config config/ppo/CrawlerParkour.yaml `
   -EnvBin envs/CrawlerParkour_Multi_linux/CrawlerParkour.x86_64 `
-  -BuildTgz .\envs\CrawlerParkour_Multi_linux.tgz
+  -BuildTgz .\envs\CrawlerParkour_Multi_linux.tgz `
+  -InitializeFrom CrawlerParkour_008_r009
 ```
+
+**Check the first summary window before walking away.** The warm start claims the
+policy is behaviourally identical to run 008 at launch, so `DistanceRate` should
+appear near run 008's final value and not near zero. That is a two-minute check
+against a 24-hour booking, and it is the only end-to-end test of the expansion.
 
 `-Config` and `-EnvBin` default to empty, which leaves `launch_training.sh` on
 its CrawlerSumoEGNN defaults — sumo invocations are unchanged.
