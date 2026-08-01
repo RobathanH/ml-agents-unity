@@ -1425,6 +1425,38 @@ is what produces `a' = s·a + o` downstream of that divide. Writing `o` would ha
 every joint a third of the way to the wrong angle, while looking entirely reasonable in
 the tensor.
 
+### 11.8a The same factor of three got the sigma anyway
+
+Run 009's first launch was killed twelve minutes in because `FootRelease` read exactly
+`0.0000` when it should have been about 0.05. `--friction-sigma 0.5` was chosen,
+documented and *verified* in **action** units, and written straight into `log_sigma`,
+which lives on the head's scale. The feet were therefore exploring at 0.167: commanded
+contact spanning 0.92–1.28 against run 008's flat 1.1, a ±16% wobble, with a genuine
+release sitting **4.8σ out** and sampled about 1.6 × 10⁻⁶ of the time. The centrepiece
+actuator of the run was, in practice, undiscoverable.
+
+Three things are worth taking from that, none of them "be more careful".
+
+**Knowing about a units trap does not protect the next place it appears.** The factor of
+three was found, understood, written into the paragraph above, and then missed in the
+adjacent line of the same function. *A conversion that is not expressed in code gets
+re-derived by hand every time it is needed, and hands miss.* It is now
+`ACTION_CLIP_SCALE`, applied at both sites.
+
+**The verifier agreed because it was quoting the wrong units.** It printed
+`friction sigma 0.500 -- exploring, not deterministic` off the raw `log_sigma` — true, and
+useless. A check has to assert the **property that matters**, not that a number is
+non-zero; the property here is that a release is reachable at all. It now converts to
+action units and reports how many sigma out a release sits.
+
+**This is what a launch check is for, and it is why the check is a metric and not a
+glance.** Every offline check passed and none of them *could* have caught this: the
+expansion was arithmetically correct, and the defect was in a value chosen for a dimension
+that did not previously exist, whose only symptom is a statistic that has to be run to
+exist. `FootRelease` at exactly zero cost about $0.30 and one re-provision. The same
+defect found in the run report would have cost the run — and would have read as "per-foot
+friction did not help", which is the wrong lesson entirely and the kind that sticks.
+
 Equivalence is exact wherever the old head did not saturate. Where it *did* — `|x| > 3`,
 meaning "further than this joint can travel" — the new angle continues past the old limit
 in the same direction the old policy was already pushing. Run 008 pinned against a
