@@ -1063,9 +1063,16 @@ cannot separate them. Run 008 read, at face value:
 | mean `TerrainLevel` | 4.66 | 6.92 |
 
 which reads as a policy falling apart. Bin the summary windows by `TerrainLevel` and
-compare early against late *inside the same bin* and the sign flips: **nine of ten
-patterns improved**, `Beam` among them. Nothing regressed. The entire apparent collapse
-was the ladder moving underneath the metric.
+compare early against late *inside the same bin* and the collapse disappears: `Beam` goes
+from −21 points raw to **+1.4 and +2.5** in the two bins with enough windows on both
+sides, and most patterns move up. The residual negatives are fractions of a point
+(`Ramp` −0.7, `Pebbles` −1.0) rather than the double-digit falls the raw series showed.
+Restricted to the 12 h extension, where the terrain moved less, **nine of ten obstacles
+improved in both well-populated bins** — `StepField` at −0.5 is the only exception.
+
+Being precise about this matters more than the headline: "nothing regressed" would be an
+overclaim, and a section arguing that the raw reading is wrong is worth nothing if the
+corrected reading is itself sanded smooth.
 
 **Rule: a statistic aggregated over a population whose difficulty is itself moving must be
 conditioned on that difficulty before it is read.** This is why `RateAtLevel/<L>` exists
