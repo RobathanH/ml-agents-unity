@@ -45,8 +45,33 @@ behaviors:
     hyperparameters:
       batch_size: 4096
       buffer_size: 40960
-      learning_rate: 0.0003
-      beta: 0.005
+      # RUN 008 EXTENSION (+12h, restart at step ~58.6M with --resume).
+      # These are NOT new hyperparameters. They are 0.0003 and 0.005 rescaled so
+      # the linear schedules are CONTINUOUS across the restart while still
+      # annealing to their floors at the new max_steps.
+      #
+      # Every schedule is anchored at step 0:
+      #     value = (v0 - vmin) * (1 - step/max_steps) + vmin
+      # (ModelUtils.polynomial_decay). So raising max_steps ALONE silently jumps
+      # every schedule back UP: LR would go 6.26e-5 -> 1.19e-4, a 1.9x increase
+      # dropped on a policy that has been converging for 58M steps and whose Adam
+      # state is restored along with it. Extending a run is not a reason to shock
+      # it. Solving instead for the v0 that reproduces the CURRENT decayed value
+      # under the new denominator,
+      #     v0' = (v_now - vmin) / (1 - s/M_new) + vmin
+      # makes the restart invisible to the optimiser and still lands the anneal on
+      # the new finish.
+      #
+      # v_now was READ from this run's own TensorBoard -- Policy/Learning Rate
+      # 6.2634e-5 and Policy/Beta 1.0518e-3 at step 58,560,000 -- not predicted,
+      # and the formula above was checked against those logged values before being
+      # used to invert it (agreed to 0.06%, which is summary-step granularity).
+      #
+      # The two floors are NOT both zero, and using one for both would be wrong at
+      # the tail: LR floors at 1e-10, beta at 1e-5 (ppo/optimizer_torch.py).
+      # epsilon is untouched because its schedule is constant, below.
+      learning_rate: 0.000158
+      beta: 0.00264
       epsilon: 0.2
       lambd: 0.95
       num_epoch: 3
@@ -85,7 +110,16 @@ behaviors:
     # LR schedule finishing just inside the booked time. Do not re-derive this from
     # the first few reporting windows -- env startup sits inside the first one and
     # made the same estimate 2.3x too low for run 006.
-    max_steps: 74000000
+    #
+    # Run 008 EXTENSION: 74M -> 97M. The run was still improving at MATCHED terrain
+    # level when it reached its 24h stop (9 of 10 patterns up, late-vs-early inside
+    # the same TerrainLevel bin) and the ladder had NOT equilibrated -- TerrainLevel
+    # was still climbing, 6.63 -> 6.92 across the last two quarters. 74M was sized
+    # off run 007's 862 steps/s; this run actually sustains 758.6 (58,500,000 steps
+    # in 77,111 s -- stiffer joints cost solver time and higher rungs cost boxes),
+    # so 97M is ~14.1h more from the restart. Sized to UNDERSHOOT the watchdog for
+    # the reason given above: ending early is free, ending with LR still high is not.
+    max_steps: 97000000
     # Deliberately ABOVE the 300 decisions an episode now contains (1500 physics
     # steps / DecisionPeriod 5), so each episode yields exactly one trajectory,
     # ending at the truncation and bootstrapped there. Splitting an episode into
