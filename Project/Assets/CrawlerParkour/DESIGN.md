@@ -1041,3 +1041,143 @@ size and date all look correct; only the tensor inside says otherwise.
 `cloud_train.ps1` now reads the seed's `global_step`, prints it, and **refuses to launch**
 if it is far behind the newest numbered checkpoint sitting in the same directory. Same
 shape as §9.6: the invariant was being trusted, and now it is checked.
+
+This is a guard, not a cure. The staging sync still skips the file, and it did it again
+during run 008 — the local copy sat at 499,800 for the entire 36 hours. The fix (compare
+mtime as well as size, and `scp -p` so the local stamp is the remote one) exists on this
+branch, but the scheduled task runs the copy in the **crawler-sumo** worktree, which
+predates it. Two checkouts of one script, one of them stale, is the actual bug.
+
+### 10.3 A moving curriculum confounds every aggregated per-obstacle statistic
+
+`Cleared/<pattern>` and `Falls/<pattern>` are summed over all arenas at whatever rung each
+has reached. While `TerrainLevel` climbs, the *same number describes harder terrain*, so
+the raw first-quarter-to-last-quarter delta measures difficulty and policy at once and
+cannot separate them. Run 008 read, at face value:
+
+| | Q1 | Q4 |
+|---|---|---|
+| `Beam` cleared | 58.1% | **36.9%** |
+| `Squeeze` cleared | 66.6% | 57.9% |
+| `Hurdle` cleared | 66.1% | 57.6% |
+| mean `TerrainLevel` | 4.66 | 6.92 |
+
+which reads as a policy falling apart. Bin the summary windows by `TerrainLevel` and
+compare early against late *inside the same bin* and the sign flips: **nine of ten
+patterns improved**, `Beam` among them. Nothing regressed. The entire apparent collapse
+was the ladder moving underneath the metric.
+
+**Rule: a statistic aggregated over a population whose difficulty is itself moving must be
+conditioned on that difficulty before it is read.** This is why `RateAtLevel/<L>` exists
+and is trustworthy while the per-pattern series are not. The per-pattern stats should be
+emitted per rung too; until they are, the binning has to be done offline, and any claim
+made from the raw series is unsupported.
+
+### 10.4 What run 008 measured
+
+**The ladder holds a spread.** This is the §9.4 fix working, and it is the run's main
+result:
+
+| | run 007 | run 008 |
+|---|---|---|
+| rungs carrying data | 6 of 10 | **10 of 10** |
+| largest single rung's share | 26.5% | **13.0%** |
+| mean `TerrainLevel`, final 4M | 8.65 | 7.42 |
+| `RateMinusGate`, final 4M | — | +0.11 |
+
+Run 007 had no measurement at all below L4 because once its ratchet turned, no arena ever
+went back down. Run 008's population sits just above its own promote gate across the whole
+ladder, which is the marginal-competence regime the curriculum is supposed to hold.
+
+**Rate at terrain level 9** — matched difficulty, and the only fair cross-run number:
+
+| | m/s |
+|---|---|
+| run 007, final 4M | 0.537 |
+| run 008 at ~32M | **0.509** |
+| run 008 pre-extension | 0.568 |
+| run 008 final | **0.603** |
+
+The dip is §10.1 measured rather than predicted: the warm-started policy really is slower
+under stiffer joints before it is faster. Final is **+12.2%** over run 007 — with the
+caveat that run 008's L9 sample is *selected* (only arenas that earned their way up are
+there) while run 007's was its entire pinned population, so that is the optimistic end.
+
+The 12 h extension bought **+6.2%** on that number, and at matched difficulty: `Beam`
++5.5 to +5.9 points, `Squeeze` +3.9 to +5.1, respawns per 100 m 0.932 → 0.807. Rate over
+speed finished at **1.055**, so the §9.1 reset fix is still holding and the distance being
+reported is still distance that was walked.
+
+### 10.5 `Gap` is not a training-duration problem, and now that is settled
+
+0.7–3.1% cleared at every rung, moving +0.1 to +0.8 across **33M additional steps**, with
+falls/entry of 0.02 — the agent stops at the edge rather than falling in. Doubling the
+joint drive did not buy a jump either, and entropy ended at −0.04, far below where it
+started and still falling, so there is no exploration left to find one with.
+
+Three hypotheses are now eliminated: not training duration, not actuation authority, not
+exploration noise. What remains is the reward. Nothing in it pays for the ballistic phase:
+the progress ratchet pays on landing, and the seconds in the air are seconds not covering
+ground. A deliberate leap is *dominated* by shuffling up to the edge and stopping. Either
+add a term that prices the air phase, or drop the pattern — but stop spending compute on
+it as-is.
+
+### 10.6 Throughput is a function of terrain level, so `max_steps` sized on the start of a run overshoots
+
+`max_steps` was sized on run 007's measured 862 steps/s. Run 008's first half delivered
+**756** and its second half **646** — a 14.6% drop between two halves of the *same run on
+the same hardware*. Higher rungs carry more obstacle boxes, so the environment gets more
+expensive exactly as the curriculum succeeds.
+
+**Rule: size `max_steps` from the throughput expected at the terrain the run will END on,
+not the one it starts on.** Undershooting remains the cheap error — the run finishes early
+and the watchdog stops it — while overshooting leaves the learning rate high at the end.
+
+### 10.7 Extending a run rewinds its schedules unless you stop it
+
+Every decayed hyperparameter in ML-Agents is anchored at step 0:
+
+```
+value = (v0 - vmin) * (1 - step/max_steps) + vmin        # ModelUtils.polynomial_decay
+```
+
+so raising `max_steps` to extend a run does not extend the anneal, it **rewinds** it. At
+run 008's resume step, going 74M → 97M alone would have taken the learning rate from
+5.99e-5 to 1.17e-4 — **+95%**, dropped on a policy 59M steps into convergence whose Adam
+state `--resume` restores along with the weights.
+
+The fix is to re-solve the initial value so the schedule passes through the value already
+in force and still reaches its floor at the new end:
+
+```
+v0' = (v_now - vmin) / (1 - s/M_new) + vmin
+```
+
+which gave +2.7% instead of +95%. Three details that matter: read `v_now` from the run's
+own TensorBoard rather than predicting it, validate the formula against those logged values
+*before* inverting it, and note that the floors differ per parameter — learning rate floors
+at 1e-10, `beta` at 1e-5, and using one for both is wrong at the tail.
+
+### 10.8 The watchdog has to wait for the trainer to appear
+
+Armed alongside a launch, the watchdog's first `pgrep` ran while the Unity environment was
+still booting, found nothing, broke out of its monitoring loop and **skipped the
+graceful-stop phase for the entire run** — so the instance would have been destroyed
+mid-step instead of SIGINTed into a final checkpoint export.
+
+Billing stays bounded either way, which is exactly why it survived two occurrences. The
+only symptom is a `training process gone` line one second after arming, which reads like a
+crash report rather than a race. `watchdog.sh` now polls for the trainer to appear first,
+and a launch that genuinely never starts still falls through to the terminate path.
+
+### 10.9 A restart does not preserve the terrain ladder
+
+Per-arena levels live in the Unity environment, not in the checkpoint. On `--resume` every
+arena restarts at `initial_level`, so run 008's population dropped from 6.92 back to ~2.5
+and spent ~20 minutes re-climbing.
+
+Cheap here — 3% of a 14 h extension — but it would dominate a short continuation, and it
+means **the first summary windows after any restart describe easier terrain**. Reward jumps
+(run 008's went 1.84 → 3.35) and the jump means nothing. Any before/after comparison across
+a restart has to discard the re-climb, which is why §10.4's extension figures skip the
+first 2M steps after the boundary.
