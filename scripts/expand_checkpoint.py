@@ -219,13 +219,14 @@ def main():
     ap.add_argument("--src", required=True)
     ap.add_argument("--dst", required=True)
     ap.add_argument("--friction-sigma", type=float, default=0.5,
-                    help="Standard deviation the four new action dimensions start "
-                         "exploring at, in action units. The default spreads the "
-                         "commanded contact over roughly 0.55-1.65 against run 008's "
-                         "flat 1.1: wide enough to discover that letting go helps, "
-                         "narrow enough that the feet are not chattering from step 1. "
-                         "Inherited log_sigma would be near-deterministic, which is "
-                         "the one thing a brand new actuator must not be.")
+                    help="Standard deviation the four new dimensions start exploring "
+                         "at, IN ACTION UNITS -- the [-1, 1] the environment sees, not "
+                         "the head's own scale. The default spreads the commanded "
+                         "contact over roughly 0.55-1.65 against run 008's flat 1.1: "
+                         "wide enough to discover that letting go helps, narrow enough "
+                         "that the feet are not chattering from step 1. Inherited "
+                         "log_sigma would be near-deterministic, which is the one thing "
+                         "a brand new actuator must not be.")
     args = ap.parse_args()
 
     ck = torch.load(args.src, map_location="cpu", weights_only=False)
@@ -321,7 +322,18 @@ def main():
     new_w = torch.zeros(NEW_ACT, mu_w.shape[1], dtype=mu_w.dtype)
     new_b = torch.zeros(NEW_ACT, dtype=mu_b.dtype)
     new_ls = torch.zeros(1, NEW_ACT, dtype=log_sigma.dtype)
-    new_ls[0, OLD_ACT:] = math.log(args.friction_sigma)
+    # ACTION_CLIP_SCALE again, and it caught us once already. --friction-sigma is
+    # quoted in action units because that is what every other number here is quoted
+    # in, but log_sigma lives on the HEAD's scale and the environment sees x/3. A
+    # sigma written straight in makes the feet explore a third as far as intended:
+    # at the intended 0.5 a genuine release is 1.6 sigma out and gets sampled ~5% of
+    # the time, at 0.5/3 it is 4.8 sigma out and is sampled never. That is the
+    # difference between an actuator the policy can discover and one it cannot, and
+    # it is invisible in every metric except FootRelease sitting at exactly zero.
+    head_sigma = args.friction_sigma * ACTION_CLIP_SCALE
+    new_ls[0, OLD_ACT:] = math.log(head_sigma)
+    print(f"  friction sigma {args.friction_sigma} in action units "
+          f"-> log_sigma {math.log(head_sigma):+.4f} on the head's scale")
 
     groups = [(HIP_X_ROWS, "hip_x"), (HIP_Y_ROWS, "hip_y"), (KNEE_X_ROWS, "knee_x")]
     for rows, joint in groups:

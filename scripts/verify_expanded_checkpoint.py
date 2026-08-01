@@ -214,8 +214,13 @@ def main():
           f"friction mean output is {float(fr.abs().max()):.2e} for every input "
           "-- a zero action is exactly the 1.1 contact run 008 ran")
     ls_n = p_n["action_model._continuous_distribution.log_sigma"][0]
-    sig = float(ls_n[OLD_ACT:].exp().mean())
-    check(0.05 < sig < 1.0, f"friction sigma {sig:.3f} -- exploring, not deterministic")
+    # IN ACTION UNITS. Quoting the head's own sigma here is what let a 3x-too-narrow
+    # actuator through the first launch: it read "0.500 -- exploring" while the feet
+    # were actually at 0.167 and had never once commanded a release.
+    sig = float(ls_n[OLD_ACT:].exp().mean()) / ACTION_CLIP_SCALE
+    check(0.3 < sig < 0.8,
+          f"friction sigma {sig:.3f} in action units -- a release (action < -0.8) sits "
+          f"{0.8 / sig:.1f} sigma out, so it gets sampled")
 
     print("\n6. exploration is preserved in ANGLE space, not action space")
     ls_o = p_o["action_model._continuous_distribution.log_sigma"][0]
